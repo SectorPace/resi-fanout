@@ -33,22 +33,25 @@
 ## 快速开始（Linux）
 
 ```bash
-# 方式一：git clone 后在项目目录里运行
+# 一键安装（自动匹配架构下载 Release 预编译包，无需装工具链）
+curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash
+
+# 带参数的一键安装（注意 bash -s -- 后跟参数）
+curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash -s -- --with-vpngate --with-3xui
+
+# 或者 clone 后本地运行
 git clone https://github.com/SectorPace/resi-fanout.git && cd resi-fanout
 sudo bash install.sh
-
-# 方式二：不装工具链，直接用 Release 预编译包（x86_64 / aarch64）
-#  到 https://github.com/SectorPace/resi-fanout/releases 下载对应架构的
-#  resi-fanout-*.tar.gz，解压后在解压目录运行 sudo bash install.sh
 ```
 
 ```bash
 # 常用参数
-sudo bash install.sh --port 7654          # 指定 API/UI 端口
-sudo bash install.sh --with-3xui          # 装完自动把出站推进本机 3x-ui
-sudo bash install.sh --with-vpngate       # 装 openvpn 并启用 VPN Gate 隧道
-sudo bash install.sh --no-frontend        # 跳过 npm 构建（用仓库自带 dist）
-sudo bash install.sh --repo https://github.com/SectorPace/resi-fanout.git   # 远程一键安装
+--port 7654        # 指定 API/UI 端口
+--with-3xui        # 装完自动把出站推进本机 3x-ui
+--with-vpngate     # 装 openvpn 并启用 VPN Gate 隧道
+--from-source      # 强制源码编译（预编译包要求 glibc >= 2.35，Debian 12 / Ubuntu 22.04+；更老系统用这个）
+--no-frontend      # 跳过 npm 构建（用仓库自带 dist）
+--repo <git-url>   # 指定仓库地址
 ```
 
 脚本会自动：装 Rust/Node 工具链 → 构建前后端 → 生成配置（随机 API Key）→ 注册 systemd 服务 `resi-fanout`。内存 <1GB 的小鸡会自动加 2G swap 保证编译不 OOM。

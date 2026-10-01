@@ -20,7 +20,9 @@ API_PORT="7654"
 WITH_3XUI="0"
 WITH_VPNGATE="0"
 REPO_URL="${REPO_URL:-https://github.com/SectorPace/resi-fanout.git}"
+GH_REPO="${GH_REPO:-SectorPace/resi-fanout}"
 NO_FRONTEND="0"
+FROM_SOURCE="0"
 
 log()  { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
@@ -29,9 +31,10 @@ die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
   case "$1" in
     --port)       API_PORT="${2:?}"; shift 2 ;;
-    --repo)       REPO_URL="${2:?}"; shift 2 ;;
+    --repo)       REPO_URL="${2:?}"; GH_REPO="${2#*github.com/}"; GH_REPO="${GH_REPO%.git}"; shift 2 ;;
     --with-3xui)  WITH_3XUI="1"; shift ;;
     --with-vpngate) WITH_VPNGATE="1"; shift ;;
+    --from-source) FROM_SOURCE="1"; shift ;;
     --no-frontend) NO_FRONTEND="1"; shift ;;
     -h|--help)
       sed -n '2,12p' "$0"; exit 0 ;;
@@ -41,23 +44,53 @@ done
 
 [ "$(id -u)" = "0" ] || die "please run as root: sudo bash $0"
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# When piped (curl ... | bash) BASH_SOURCE is "bash"; dirname then resolves
+# to the current directory, so the local-tree checks below simply miss and
+# the prebuilt-release / clone paths take over.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
 
 # ---------------------------------------------------------------- source tree
+# priority: local checkout > local release-tarball layout > GitHub release
+# download (fast, no toolchain) > git clone + build (--from-source forces this)
 SRC_DIR=""
-if [ -f "${SCRIPT_DIR}/backend/Cargo.toml" ] && [ -f "${SCRIPT_DIR}/frontend/package.json" ]; then
+PREBUILT="0"
+
+if [ "${FROM_SOURCE}" != "1" ] && [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/backend/Cargo.toml" ] && [ -f "${SCRIPT_DIR}/frontend/package.json" ]; then
   SRC_DIR="${SCRIPT_DIR}"
   log "using source tree at ${SRC_DIR}"
-elif [ -f "${SCRIPT_DIR}/bin/${APP}" ]; then
+elif [ "${FROM_SOURCE}" != "1" ] && [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/bin/${APP}" ]; then
   # release tarball layout: bin/ web/ scripts/ config.example.json
   SRC_DIR="${SCRIPT_DIR}"
   PREBUILT="1"
   log "using prebuilt binary from ${SRC_DIR}/bin/${APP} (skipping build)"
+elif [ "${FROM_SOURCE}" != "1" ]; then
+  case "$(uname -m)" in
+    x86_64)          TGT="x86_64-unknown-linux-gnu" ;;
+    aarch64|arm64)   TGT="aarch64-unknown-linux-gnu" ;;
+    *)               TGT="" ;;
+  esac
+  TMP="$(mktemp -d)"
+  if [ -n "${TGT}" ] && curl -fsSL "https://github.com/${GH_REPO}/releases/latest/download/resi-fanout-${TGT}.tar.gz" -o "${TMP}/app.tar.gz" 2>/dev/null; then
+    log "downloaded prebuilt release for ${TGT} — installing (no toolchain needed)"
+    tar xzf "${TMP}/app.tar.gz" -C "${TMP}"
+    SRC_DIR="${TMP}/resi-fanout-${TGT}"
+    PREBUILT="1"
+  else
+    warn "no prebuilt release for this machine — falling back to source build (installs Rust, takes a few minutes)"
+    command -v git >/dev/null 2>&1 || install_pkgs git || die "git is required for source install"
+    git clone --depth 1 "${REPO_URL}" "${TMP}/src" >&2
+    SRC_DIR="${TMP}/src"
+  fi
 else
-  [ -n "${REPO_URL}" ] || die "run this script from the project directory, or pass --repo <git-url>"
-  SRC_DIR="$(mktemp -d)/src"
-  log "cloning ${REPO_URL}"
-  git clone --depth 1 "${REPO_URL}" "${SRC_DIR}"
+  [ -n "${REPO_URL}" ] || die "--from-source needs --repo <git-url> or a clone directory"
+  if [ -f "${SCRIPT_DIR}/backend/Cargo.toml" ]; then
+    SRC_DIR="${SCRIPT_DIR}"
+  else
+    TMP="$(mktemp -d)"
+    git clone --depth 1 "${REPO_URL}" "${TMP}/src" >&2
+    SRC_DIR="${TMP}/src"
+  fi
+  log "building from source at ${SRC_DIR}"
 fi
 
 # ---------------------------------------------------------------- system deps
