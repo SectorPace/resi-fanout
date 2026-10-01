@@ -1,0 +1,105 @@
+{
+  "server": {
+    "listen": "127.0.0.1:7654",
+    "api_key": "__API_KEY__",
+    "web_root": "/opt/resi-fanout/web"
+  },
+  "fanout": {
+    "bind": "127.0.0.1",
+    "base_port": 20000,
+    "mode": "socks",
+    "max_ports": 100
+  },
+  "checker": {
+    "timeout_secs": 8,
+    "concurrency": 256,
+    "max_pool": 4000,
+    "classify_url": "http://ip-api.com/json/?fields=status,message,country,countryCode,isp,org,as,hosting,proxy,query"
+  },
+  "scheduler": {
+    "refresh_minutes": 30,
+    "recheck_minutes": 20,
+    "prune_days": 7
+  },
+  "filter": {
+    "only_residential": false,
+    "countries": [],
+    "protocols": []
+  },
+  "vpngate": {
+    "enabled": false,
+    "base_port": 21000,
+    "max_servers": 3,
+    "countries": [],
+    "min_speed_mbps": 5,
+    "openvpn_bin": "openvpn",
+    "only_residential": false,
+    "api_url": "https://www.vpngate.net/api/iphone/",
+    "scripts_dir": "/opt/resi-fanout/scripts"
+  },
+  "sources": [
+    {
+      "name": "monosans",
+      "kind": "monosans",
+      "url": "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies.json",
+      "protocol": null,
+      "enabled": true
+    },
+    {
+      "name": "thespeedx-http",
+      "kind": "text",
+      "url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+      "protocol": "http",
+      "enabled": true
+    },
+    {
+      "name": "thespeedx-socks4",
+      "kind": "text",
+      "url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+      "protocol": "socks4",
+      "enabled": true
+    },
+    {
+      "name": "thespeedx-socks5",
+      "kind": "text",
+      "url": "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+      "protocol": "socks5",
+      "enabled": true
+    },
+    {
+      "name": "hideip-http",
+      "kind": "text",
+      "url": "https://raw.githubusercontent.com/zloi-user/hideip.me/main/http.txt",
+      "protocol": "http",
+      "enabled": true
+    },
+    {
+      "name": "hideip-socks4",
+      "kind": "text",
+      "url": "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks4.txt",
+      "protocol": "socks4",
+      "enabled": true
+    },
+    {
+      "name": "hideip-socks5",
+      "kind": "text",
+      "url": "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks5.txt",
+      "protocol": "socks5",
+      "enabled": true
+    },
+    {
+      "name": "proxifly",
+      "kind": "text",
+      "url": "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/all/data.txt",
+      "protocol": null,
+      "enabled": true
+    },
+    {
+      "name": "geonode",
+      "kind": "geonode",
+      "url": "https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc",
+      "protocol": null,
+      "enabled": true
+    }
+  ]
+}

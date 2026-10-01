@@ -1,0 +1,624 @@
+import { api, type Config, type PortEntry, type Snippet, type VpngateInfo } from "./api";
+import { badge, el, toast } from "./main";
+
+const PAGE_SIZE = 100;
+
+const proxyState = {
+  alive: "1",
+  residential: false,
+  proto: "",
+  country: "",
+  q: "",
+  offset: 0
+};
+
+export function renderProxies(root: HTMLElement): void {
+  root.replaceChildren(
+    el(
+      "div",
+      { class: "filterbar" },
+      el(
+        "select",
+        {
+          onchange: (e) => {
+            proxyState.alive = (e.target as HTMLSelectElement).value;
+            void reload();
+          }
+        },
+        el("option", { value: "1" }, "仅存活"),
+        el("option", { value: "0" }, "仅失效"),
+        el("option", { value: "" }, "全部状态")
+      ),
+      el("select", {
+        onchange: (e) => {
+          proxyState.proto = (e.target as HTMLSelectElement).value;
+          void reload();
+        }
+      },
+        el("option", { value: "" }, "全部协议"),
+        el("option", { value: "http" }, "http"),
+        el("option", { value: "socks4" }, "socks4"),
+        el("option", { value: "socks5" }, "socks5")
+      ),
+      el("input", {
+        placeholder: "国家代码，如 US",
+        style: "width:110px",
+        value: proxyState.country,
+        onchange: (e) => {
+          proxyState.country = (e.target as HTMLInputElement).value.trim();
+          void reload();
+        }
+      }),
+      el("input", {
+        placeholder: "搜索 ip / isp…",
+        style: "flex:1",
+        value: proxyState.q,
+        onchange: (e) => {
+          proxyState.q = (e.target as HTMLInputElement).value.trim();
+          void reload();
+        }
+      }),
+      el("label", { class: "chk" },
+        checkbox(proxyState.residential, (v) => {
+          proxyState.residential = v;
+          void reload();
+        }),
+        " 仅住宅"
+      )
+    ),
+    el("div", { id: "proxy-table" }),
+    el(
+      "div",
+      { class: "pager" },
+      el("button", { id: "pg-prev", onclick: () => page(-1) }, "上一页"),
+      el("span", { id: "pg-info" }),
+      el("button", { id: "pg-next", onclick: () => page(1) }, "下一页")
+    )
+  );
+
+  function checkbox(v: boolean, on: (v: boolean) => void): HTMLInputElement {
+    const c = el("input", { type: "checkbox" }) as HTMLInputElement;
+    c.checked = v;
+    c.addEventListener("change", () => on(c.checked));
+    return c;
+  }
+
+  async function page(delta: number): Promise<void> {
+    proxyState.offset = Math.max(0, proxyState.offset + delta * PAGE_SIZE);
+    await reload();
+  }
+
+  async function reload(): Promise<void> {
+    const box = document.getElementById("proxy-table");
+    if (!box) return;
+    const params = new URLSearchParams({
+      limit: String(PAGE_SIZE),
+      offset: String(proxyState.offset)
+    });
+    if (proxyState.alive !== "") params.set("alive", proxyState.alive);
+    if (proxyState.residential) params.set("residential", "1");
+    if (proxyState.proto) params.set("proto", proxyState.proto);
+    if (proxyState.country) params.set("country", proxyState.country);
+    if (proxyState.q) params.set("q", proxyState.q);
+    try {
+      const { total, items } = await api.proxies(params.toString());
+      const info = document.getElementById("pg-info");
+      if (info) info.textContent = `第 ${proxyState.offset + 1}-${proxyState.offset + items.length} 条 / 共 ${total}`;
+      box.replaceChildren(
+        el(
+          "table",
+          { class: "tbl" },
+          el(
+            "thead",
+            {},
+            el(
+              "tr",
+              {},
+              el("th", {}, "代理"),
+              el("th", {}, "协议"),
+              el("th", {}, "国家"),
+              el("th", {}, "ISP"),
+              el("th", {}, "延迟"),
+              el("th", {}, "状态"),
+              el("th", {}, "本地端口")
+            )
+          ),
+          el(
+            "tbody",
+            {},
+            ...items.map((p) =>
+              el(
+                "tr",
+                {},
+                el("td", { class: "mono" }, p.key),
+                el("td", {}, p.protocol),
+                el("td", {}, p.country_code || "—"),
+                el("td", { class: "dim" }, p.isp || "—"),
+                el("td", {}, p.latency_ms != null ? `${p.latency_ms}ms` : "—"),
+                el(
+                  "td",
+                  {},
+                  p.alive ? badge("存活", "ok") : badge("失效", "err"),
+                  " ",
+                  p.residential ? badge("住宅", "res") : p.hosting === true ? badge("机房", "") : ""
+                ),
+                el("td", { class: "mono" }, p.local_port ? String(p.local_port) : "—")
+              )
+            )
+          )
+        )
+      );
+    } catch (e) {
+      box.replaceChildren(el("div", { class: "error" }, String(e)));
+    }
+  }
+
+  void reload();
+}
+
+export function renderPorts(root: HTMLElement): void {
+  root.replaceChildren(
+    el(
+      "div",
+      { class: "actions" },
+      el("button", {
+        onclick: async () => {
+          try {
+            const { items } = await api.ports();
+            const lines = items.map((p) => `socks5://127.0.0.1:${p.port}#${p.country_code || p.protocol}-${p.port}`);
+            await navigator.clipboard.writeText(lines.join("\n"));
+            toast(`已复制 ${lines.length} 条 socks 链接`);
+          } catch (e) { toast(String(e), false); }
+        }
+      }, "复制全部 socks 链接"),
+      el("button", { onclick: () => void reload() }, "刷新列表")
+    ),
+    el("div", { id: "port-table" })
+  );
+
+  async function reload(): Promise<void> {
+    const box = document.getElementById("port-table");
+    if (!box) return;
+    try {
+      const { items } = await api.ports();
+      box.replaceChildren(
+        el(
+          "table",
+          { class: "tbl" },
+          el(
+            "thead",
+            {},
+            el(
+              "tr",
+              {},
+              el("th", {}, "本地端口"),
+              el("th", {}, "上游代理"),
+              el("th", {}, "协议"),
+              el("th", {}, "国家"),
+              el("th", {}, "延迟"),
+              el("th", {}, "类型")
+            )
+          ),
+          el(
+            "tbody",
+            {},
+            ...items.map((p: PortEntry) =>
+              el(
+                "tr",
+                {},
+                el("td", { class: "mono strong" }, String(p.port)),
+                el("td", { class: "mono" }, p.key),
+                el("td", {}, p.protocol),
+                el("td", {}, p.country_code || "—"),
+                el("td", {}, p.latency_ms != null ? `${p.latency_ms}ms` : "—"),
+                el(
+                  "td",
+                  {},
+                  p.residential ? badge("住宅", "res") : badge("机房", ""),
+                  " ",
+                  p.kind === "vpngate" ? badge("VPN Gate", "") : ""
+                )
+              )
+            )
+          )
+        )
+      );
+    } catch (e) {
+      box.replaceChildren(el("div", { class: "error" }, String(e)));
+    }
+  }
+
+  void reload();
+}
+
+export function renderVpngate(root: HTMLElement): void {
+  root.replaceChildren(
+    el(
+      "div",
+      { class: "actions" },
+      el("button", { class: "primary", onclick: () => void reload() }, "刷新"),
+      el("button", {
+        onclick: async () => {
+          try {
+            await api.vpngateRebuild();
+            toast("已清空隧道分配，管理器将重新选点");
+            setTimeout(() => void reload(), 1500);
+          } catch (e) { toast(String(e), false); }
+        }
+      }, "重新选点"),
+      el("span", { id: "vg-hint", class: "dim" })
+    ),
+    el("div", { id: "vg-tunnels" }),
+    el("h3", {}, "候选服务器（按 Score 排序，前 50）"),
+    el("div", { id: "vg-pool" })
+  );
+
+  async function reload(): Promise<void> {
+    let info: VpngateInfo;
+    const hint = document.getElementById("vg-hint");
+    try {
+      info = await api.vpngate();
+    } catch (e) {
+      const t = document.getElementById("vg-tunnels");
+      if (t) t.replaceChildren(el("div", { class: "error" }, String(e)));
+      return;
+    }
+    if (hint) {
+      hint.textContent = info.enabled
+        ? ` 已启用 · 池 ${info.pool_size} 台 · 更新 ${fmtTs2(info.pool_ts)}`
+        : " 未启用：在「配置」页开启 vpngate.enabled 并安装 openvpn";
+    }
+    const tb = document.getElementById("vg-tunnels");
+    if (tb) {
+      tb.replaceChildren(
+        el(
+          "table",
+          { class: "tbl" },
+          el("thead", {}, el("tr", {},
+            el("th", {}, "本地端口"), el("th", {}, "服务器"), el("th", {}, "出口国家"),
+            el("th", {}, "ISP"), el("th", {}, "延迟"), el("th", {}, "隧道状态"), el("th", {}, "出口类型")
+          )),
+          el("tbody", {},
+            ...(info.tunnels.length
+              ? info.tunnels.map((t) => el("tr", {},
+                  el("td", { class: "mono strong" }, String(t.local_port)),
+                  el("td", { class: "mono" }, t.hostname),
+                  el("td", {}, t.country_code || "—"),
+                  el("td", { class: "dim" }, t.isp || "—"),
+                  el("td", {}, t.latency_ms != null ? `${t.latency_ms}ms` : "—"),
+                  el("td", {}, badge(t.status, t.status === "up" ? "ok" : t.status === "spawning" ? "warn" : "err")),
+                  el("td", {}, t.residential ? badge("住宅", "res") : t.hosting === true ? badge("机房", "") : t.alive ? badge("住宅?", "res") : "—")
+                ))
+              : [el("tr", {}, el("td", { colspan: "7", class: "dim" }, info.enabled ? "隧道建立中…（首次连接约需 10-30 秒）" : "未启用"))])
+          )
+        )
+      );
+    }
+    const pb = document.getElementById("vg-pool");
+    if (pb) {
+      pb.replaceChildren(
+        el(
+          "table",
+          { class: "tbl" },
+          el("thead", {}, el("tr", {},
+            el("th", {}, "主机"), el("th", {}, "国家"), el("th", {}, "速度"),
+            el("th", {}, "Ping"), el("th", {}, "会话数"), el("th", {}, "运行时长"), el("th", {}, "日志"), el("th", {}, "Score")
+          )),
+          el("tbody", {},
+            ...info.top.slice(0, 50).map((s) => el("tr", {},
+              el("td", { class: "mono" }, s.hostname),
+              el("td", {}, s.country_code || "—"),
+              el("td", {}, `${s.speed_mbps} Mbps`),
+              el("td", {}, `${s.ping_ms}ms`),
+              el("td", {}, String(s.sessions)),
+              el("td", {}, fmtUptime2(s.uptime_secs)),
+              el("td", {}, s.logs_kept == null ? "—" : s.logs_kept ? badge("记录", "warn") : badge("不记录", "ok")),
+              el("td", {}, String(s.score))
+            ))
+          )
+        )
+      );
+    }
+  }
+
+  function fmtTs2(ts?: number | null): string {
+    return ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
+  }
+  function fmtUptime2(secs: number): string {
+    const d = Math.floor(secs / 86400);
+    const h = Math.floor((secs % 86400) / 3600);
+    return d > 0 ? `${d}天${h}时` : `${h}时`;
+  }
+
+  void reload();
+  const timer = window.setInterval(() => void reload(), 15000);
+  const obs = new MutationObserver(() => {
+    if (!document.body.contains(root)) {
+      window.clearInterval(timer);
+      obs.disconnect();
+    }
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
+}
+
+export async function renderConfig(root: HTMLElement): Promise<void> {
+  let cfg: Config;
+  try {
+    cfg = await api.config();
+  } catch (e) {
+    root.replaceChildren(el("div", { class: "error" }, String(e)));
+    return;
+  }
+
+  const f = (label: string, id: string, value: string | number, hint = ""): HTMLElement =>
+    el(
+      "div",
+      { class: "field" },
+      el("label", { for: id }, label),
+      el("input", { id, value: String(value) }),
+      hint ? el("small", { class: "dim" }, hint) : el("span")
+    );
+
+  const chk = (id: string, label: string, v: boolean): HTMLElement => {
+    const c = el("input", { id, type: "checkbox" }) as HTMLInputElement;
+    c.checked = v;
+    return el("label", { class: "chk field-inline" }, c, " ", label);
+  };
+
+  const get = (id: string): string => (document.getElementById(id) as HTMLInputElement).value.trim();
+  const getn = (id: string): number => Number(get(id));
+
+  root.replaceChildren(
+    el(
+      "div",
+      { class: "grid2" },
+      el(
+        "fieldset",
+        {},
+        el("legend", {}, "服务"),
+        f("监听地址 (API/UI)", "c-listen", cfg.server.listen),
+        f("API Key（留空=不鉴权）", "c-apikey", cfg.server.api_key),
+        f("前端目录", "c-web", cfg.server.web_root)
+      ),
+      el(
+        "fieldset",
+        {},
+        el("legend", {}, "扇出端口"),
+        f("绑定地址", "c-bind", cfg.fanout.bind),
+        f("起始端口", "c-base", cfg.fanout.base_port),
+        el(
+          "div",
+          { class: "field" },
+          el("label", { for: "c-mode" }, "本地端口协议"),
+          el(
+            "select",
+            { id: "c-mode" },
+            el("option", { value: "socks", ...(cfg.fanout.mode === "socks" ? { selected: "" } : {}) }, "socks"),
+            el("option", { value: "http", ...(cfg.fanout.mode === "http" ? { selected: "" } : {}) }, "http"),
+            el("option", { value: "mixed", ...(cfg.fanout.mode === "mixed" ? { selected: "" } : {}) }, "mixed（自动识别）")
+          )
+        ),
+        f("最大端口数", "c-max", cfg.fanout.max_ports)
+      ),
+      el(
+        "fieldset",
+        {},
+        el("legend", {}, "检测与调度"),
+        f("检测超时(秒)", "c-timeout", cfg.checker.timeout_secs),
+        f("并发数", "c-conc", cfg.checker.concurrency),
+        f("节点池上限", "c-pool", cfg.checker.max_pool),
+        f("抓取间隔(分钟, 0=停)", "c-refresh", cfg.scheduler.refresh_minutes),
+        f("复检间隔(分钟)", "c-recheck", cfg.scheduler.recheck_minutes),
+        f("失效保留(天)", "c-prune", cfg.scheduler.prune_days)
+      ),
+      el(
+        "fieldset",
+        {},
+        el("legend", {}, "过滤"),
+        chk("c-resi", "仅扇出住宅 IP（hosting=false）", cfg.filter.only_residential),
+        f("国家白名单(逗号分隔, 空=全部)", "c-countries", cfg.filter.countries.join(",")),
+        f("协议白名单(逗号分隔, 空=全部)", "c-protocols", cfg.filter.protocols.join(","))
+      ),
+      el(
+        "fieldset",
+        {},
+        el("legend", {}, "VPN Gate（OpenVPN 旁挂隧道）"),
+        chk("c-vg-enabled", "启用（需要 openvpn 与 root/NET_ADMIN）", cfg.vpngate.enabled),
+        f("起始端口", "c-vg-base", cfg.vpngate.base_port),
+        f("隧道数量", "c-vg-max", cfg.vpngate.max_servers),
+        f("国家白名单(逗号分隔, 空=最优)", "c-vg-countries", cfg.vpngate.countries.join(",")),
+        f("最低速度(Mbps)", "c-vg-speed", cfg.vpngate.min_speed_mbps),
+        f("openvpn 可执行文件", "c-vg-bin", cfg.vpngate.openvpn_bin),
+        chk("c-vg-resi", "仅保留住宅出口隧道（机房出口自动换点）", cfg.vpngate.only_residential)
+      )
+    ),
+    el(
+      "fieldset",
+      {},
+      el("legend", {}, "代理源（JSON 数组）"),
+      el("small", { class: "dim" },
+        "kind: text（纯文本 ip:port）/ monosans / geonode；付费住宅服务商只要输出 ip:port 或 proto://ip:port 的 URL 也能直接接入"),
+      el("textarea", {
+        id: "c-sources",
+        class: "code",
+        rows: "10",
+        style: "width:100%"
+      }, JSON.stringify(cfg.sources, null, 2)),
+      el(
+        "div",
+        { class: "actions" },
+        el(
+          "button",
+          {
+            class: "primary",
+            onclick: async () => {
+              try {
+                const next: Config = {
+                  server: {
+                    listen: get("c-listen"),
+                    api_key: get("c-apikey"),
+                    web_root: get("c-web")
+                  },
+                  fanout: {
+                    bind: get("c-bind"),
+                    base_port: getn("c-base"),
+                    mode: (document.getElementById("c-mode") as HTMLSelectElement).value,
+                    max_ports: getn("c-max")
+                  },
+                  checker: {
+                    timeout_secs: getn("c-timeout"),
+                    concurrency: getn("c-conc"),
+                    max_pool: getn("c-pool"),
+                    classify_url: cfg.checker.classify_url
+                  },
+                  scheduler: {
+                    refresh_minutes: getn("c-refresh"),
+                    recheck_minutes: getn("c-recheck"),
+                    prune_days: getn("c-prune")
+                  },
+                  filter: {
+                    only_residential: (document.getElementById("c-resi") as HTMLInputElement).checked,
+                    countries: get("c-countries")
+                      ? get("c-countries").split(",").map((s) => s.trim()).filter(Boolean)
+                      : [],
+                    protocols: get("c-protocols")
+                      ? get("c-protocols").split(",").map((s) => s.trim()).filter(Boolean)
+                      : []
+                  },
+                  vpngate: {
+                    enabled: (document.getElementById("c-vg-enabled") as HTMLInputElement).checked,
+                    base_port: getn("c-vg-base"),
+                    max_servers: getn("c-vg-max"),
+                    countries: get("c-vg-countries")
+                      ? get("c-vg-countries").split(",").map((s) => s.trim()).filter(Boolean)
+                      : [],
+                    min_speed_mbps: getn("c-vg-speed"),
+                    openvpn_bin: get("c-vg-bin"),
+                    only_residential: (document.getElementById("c-vg-resi") as HTMLInputElement).checked,
+                    api_url: cfg.vpngate.api_url,
+                    scripts_dir: cfg.vpngate.scripts_dir
+                  },
+                  sources: JSON.parse((document.getElementById("c-sources") as HTMLTextAreaElement).value)
+                };
+                await api.saveConfig(next);
+                toast("配置已保存并生效");
+              } catch (e) {
+                toast(String(e), false);
+              }
+            }
+          },
+          "保存配置"
+        )
+      )
+    )
+  );
+}
+
+export function renderXui(root: HTMLElement): void {
+  root.replaceChildren(
+    el(
+      "div",
+      { class: "grid2" },
+      el(
+        "fieldset",
+        {},
+        el("legend", {}, "生成出站配置"),
+        el("small", { class: "dim" }, "选择要接入 3x-ui 的本地端口（默认全部已分配端口），生成 Xray outbounds。"),
+        el("div", { id: "xui-ports", class: "portlist" }),
+        el(
+          "div",
+          { class: "field" },
+          el("label", { for: "xui-prefix" }, "出站 tag 前缀"),
+          el("input", { id: "xui-prefix", value: "resi" })
+        ),
+        el(
+          "div",
+          { class: "actions" },
+          el("button", { class: "primary", onclick: () => void gen(false) }, "生成"),
+          el("button", { onclick: () => void gen(true) }, "仅住宅端口")
+        )
+      ),
+      el(
+        "fieldset",
+        {},
+        el("legend", {}, "使用方法"),
+        el(
+          "ol",
+          { class: "steps" },
+          el("li", {}, "3x-ui 面板 → 设置 → Xray 配置，把下方 outbounds 合并进 outbounds 数组，保存后 Xray 自动重启。"),
+          el("li", {}, "需要按入站分流时，把 rules_example 的 inboundTag 改成你的入站 tag，加入 routing.rules。"),
+          el("li", {}, "或者直接在服务器上运行: ", el("code", { class: "mono" }, "bash /opt/resi-fanout/scripts/3xui-push.sh --api http://127.0.0.1:7654 --key <API_KEY>"), "（自动写入面板配置并重启 x-ui）")
+        )
+      )
+    ),
+    el("div", { id: "xui-output" })
+  );
+
+  async function gen(residentialOnly: boolean): Promise<void> {
+    const out = document.getElementById("xui-output");
+    if (!out) return;
+    const params = new URLSearchParams();
+    const prefix = (document.getElementById("xui-prefix") as HTMLInputElement).value.trim() || "resi";
+    params.set("prefix", prefix);
+    if (residentialOnly) {
+      params.set("residential", "1");
+    } else {
+      const checked = checkedPorts();
+      if (checked.length) params.set("ports", checked.join(","));
+    }
+    try {
+      const sn: Snippet = await api.snippet(params.toString());
+      const block = (title: string, data: unknown): HTMLElement =>
+        el(
+          "fieldset",
+          {},
+          el("legend", {}, title),
+          el("textarea", { class: "code", rows: "10", style: "width:100%" }, JSON.stringify(data, null, 2)),
+          el("button", {
+            onclick: (e) => {
+              const btn = e.target as HTMLButtonElement;
+              const ta = btn.previousElementSibling as HTMLTextAreaElement;
+              void navigator.clipboard.writeText(ta.value);
+              toast("已复制");
+            }
+          }, "复制")
+        );
+      out.replaceChildren(
+        el("div", { class: "dim" }, sn.usage),
+        block("outbounds（合并进 Xray 配置的 outbounds 数组）", sn.outbounds),
+        block("rules_example（分流规则示例）", sn.rules_example),
+        block("full_template（3x-ui 数据库无模板时可用）", sn.full_template)
+      );
+    } catch (e) {
+      out.replaceChildren(el("div", { class: "error" }, String(e)));
+    }
+  }
+
+  function checkedPorts(): number[] {
+    return Array.from(
+      document.querySelectorAll<HTMLInputElement>("#xui-ports input:checked")
+    ).map((c) => Number(c.dataset.port));
+  }
+
+  void (async () => {
+    const box = document.getElementById("xui-ports");
+    if (!box) return;
+    try {
+      const { items } = await api.ports();
+      box.replaceChildren(
+        ...items.map((p) => {
+          const c = el("input", { type: "checkbox", "data-port": String(p.port) }) as HTMLInputElement;
+          c.checked = true;
+          return el(
+            "label",
+            { class: "chk" },
+            c,
+            ` ${p.port} (${p.protocol}${p.residential ? "·住宅" : ""}${p.country_code ? "·" + p.country_code : ""})`
+          );
+        })
+      );
+    } catch {
+      box.replaceChildren(el("span", { class: "dim" }, "无法加载端口列表"));
+    }
+  })();
+}

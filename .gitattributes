@@ -1,0 +1,5 @@
+# Everything in this repo must use LF: the shell scripts are executed on
+# Linux servers where CRLF breaks bash ("$'\r': command not found").
+* text=auto eol=lf
+*.png binary
+*.gz binary

@@ -1,0 +1,31 @@
+[package]
+name = "resi-fanout"
+version = "1.0.0"
+edition = "2021"
+description = "Fetch free/residential proxies, health-check them, fan each one out to a local port, and hand the ports to 3x-ui as Xray outbounds."
+license = "MIT"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
+codegen-units = 1
+
+[features]
+default = ["tls-rustls"]
+# default on Linux: pure-rust TLS, no system OpenSSL needed
+tls-rustls = ["reqwest/rustls-tls"]
+# handy on Windows dev boxes (Schannel), no C toolchain required
+tls-native = ["reqwest/native-tls"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = "0.7"
+tower-http = { version = "0.5", features = ["fs"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+reqwest = { version = "0.12", default-features = false, features = ["gzip"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
