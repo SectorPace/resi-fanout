@@ -316,12 +316,77 @@ export function renderVpngate(root: HTMLElement): void {
         }, "导入这份配置"),
         el("small", { class: "dim" }, "支持 wgcf 生成的配置或手写 WireGuard 配置；私钥只存在本机 /var/lib/resi-fanout/warp/warp.conf")
       ),
-      el("textarea", { id: "warp-out", class: "code", rows: "8", style: "width:100%;display:none" })
+      el("textarea", { id: "warp-out", class: "code", rows: "8", style: "width:100%;display:none" }),
+      el(
+        "fieldset",
+        { style: "border:0;padding:0;margin:0" },
+        el("legend", {}, "从 Clash / Mihomo 配置导入 MASQUE 节点"),
+        el("textarea", {
+          id: "clash-yaml",
+          class: "code",
+          rows: "5",
+          style: "width:100%",
+          placeholder: "把 Clash / Mihomo 配置里的 proxies 段整段粘进来（含 type: masque 的节点）"
+        }),
+        el(
+          "div",
+          { class: "filterbar" },
+          el("select", { id: "clash-pick" }, el("option", { value: "-1" }, "先点「解析节点」")),
+          el("button", {
+            onclick: async () => {
+              const yaml = (document.getElementById("clash-yaml") as HTMLTextAreaElement).value;
+              if (!yaml.trim()) { toast("先粘贴 Clash 配置", false); return; }
+              try {
+                const r = await api.warpImportClash(yaml);
+                const sel = document.getElementById("clash-pick") as HTMLSelectElement;
+                sel.replaceChildren(
+                  ...r.nodes.map((n) =>
+                    el("option", { value: String(n.index) }, `${n.name} · ${n.server}:${n.port} · ${n.kind}`)
+                  )
+                );
+                toast(`解析到 ${r.count} 个 MASQUE/WireGuard 节点`);
+              } catch (e) { toast(String(e), false); }
+            }
+          }, "解析节点"),
+          el("button", {
+            class: "primary",
+            onclick: () => void applyClash("masque")
+          }, "按 MASQUE 应用（推荐）"),
+          el("button", {
+            onclick: () => void applyClash("wireguard")
+          }, "按 WireGuard 应用")
+        ),
+        el("small", { class: "dim" },
+          "MASQUE 节点用 Cloudflare 的多算法密钥容器，只有 Mihomo 能正确消费，因此走 Mihomo 旁挂；应用后该端口会出现在「本地端口」页并可联动 3x-ui。"),
+        el("div", { id: "clash-result" })
+      )
     ),
     el("div", { id: "vg-tunnels" }),
     el("h3", {}, "候选服务器（按 Score 排序，前 50）"),
     el("div", { id: "vg-pool" })
   );
+
+  async function applyClash(mode: "masque" | "wireguard"): Promise<void> {
+    const out = document.getElementById("clash-result");
+    const sel = document.getElementById("clash-pick") as HTMLSelectElement;
+    const yaml = (document.getElementById("clash-yaml") as HTMLTextAreaElement).value;
+    const index = Number(sel.value);
+    if (index < 0) { toast("先解析并选择一个节点", false); return; }
+    try {
+      const r = await api.warpApplyClash(yaml, index, mode);
+      const msg = [
+        `已应用：${r.node}`,
+        r.mode === "masque" ? `Mihomo 旁挂端口 ${r.port}` : "已存为 WireGuard 配置，点「连接」生效",
+        r.sidecar_started === false && r.hint ? `（未自动启动：${r.hint}）` : ""
+      ].filter(Boolean).join(" · ");
+      if (out) out.replaceChildren(el("div", { class: "error", style: "border-color:var(--ok);color:var(--ok);background:rgba(63,185,111,.1)" }, msg));
+      toast(msg);
+      await loadWarp();
+    } catch (e) {
+      if (out) out.replaceChildren(el("div", { class: "error" }, String(e)));
+      toast(String(e), false);
+    }
+  }
 
   async function loadWarp(): Promise<void> {
     const box = document.getElementById("warp-status");

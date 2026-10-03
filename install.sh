@@ -20,6 +20,7 @@ API_PORT="7654"
 WITH_3XUI="0"
 WITH_VPNGATE="0"
 WITH_WARP="0"
+WITH_MASQUE="0"
 REPO_URL="${REPO_URL:-https://github.com/SectorPace/resi-fanout.git}"
 GH_REPO="${GH_REPO:-SectorPace/resi-fanout}"
 NO_FRONTEND="0"
@@ -36,6 +37,7 @@ while [ $# -gt 0 ]; do
     --with-3xui)  WITH_3XUI="1"; shift ;;
     --with-vpngate) WITH_VPNGATE="1"; shift ;;
     --with-warp)   WITH_WARP="1"; shift ;;
+    --with-masque) WITH_MASQUE="1"; shift ;;
     --from-source) FROM_SOURCE="1"; shift ;;
     --no-frontend) NO_FRONTEND="1"; shift ;;
     -h|--help)
@@ -149,6 +151,21 @@ if [ "${mem_kb:-999999999}" -lt 1000000 ] && ! swapon --show 2>/dev/null | grep 
     mkswap /swapfile-resi >/dev/null
   fi
   swapon /swapfile-resi 2>/dev/null || true
+fi
+
+if [ "${WITH_MASQUE}" = "1" ]; then
+  log "installing mihomo (native MASQUE support for Clash-style nodes)"
+  ARCH_M="$(uname -m)"
+  case "${ARCH_M}" in
+    x86_64)        MURL="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-amd64-v1.19.12.gz" ;;
+    aarch64|arm64) MURL="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-arm64-v1.19.12.gz" ;;
+    *)             MURL="" ;;
+  esac
+  if [ -n "${MURL}" ] && curl -fsSL "${MURL}" | gzip -dc > /usr/local/bin/mihomo 2>/dev/null; then
+    chmod +x /usr/local/bin/mihomo
+  else
+    warn "mihomo download failed — MASQUE nodes can still be imported, just run mihomo manually"
+  fi
 fi
 
 # ---------------------------------------------------------------- toolchain

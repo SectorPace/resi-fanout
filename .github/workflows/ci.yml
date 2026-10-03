@@ -17,6 +17,9 @@ jobs:
       - name: Check
         working-directory: backend
         run: cargo check --locked
+      - name: Test
+        working-directory: backend
+        run: cargo test --locked
       - name: Build release
         working-directory: backend
         run: cargo build --release

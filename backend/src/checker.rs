@@ -246,6 +246,36 @@ pub async fn check_everything(state: &Arc<AppState>) {
     let _ = state.save_state().await;
 }
 
+/// Classify any upstream proxy (http/socks4/socks5) — same classifier
+/// request, but dialling through the proxy instead of a local tunnel IP.
+pub(crate) async fn classify_via_proxy(key: &str, cfg: &crate::config::Config) -> Option<(ExitInfo, u64)> {
+    let target = Target::from_url(&cfg.checker.classify_url);
+    let timeout = Duration::from_secs(cfg.checker.timeout_secs.max(1));
+    let start = Instant::now();
+    let fut = async {
+        let (proto, ip, port) = split_key(key)?;
+        let mut s = match proto {
+            Protocol::Socks5 => relay::socks5_dial(&ip, port, &target.host, target.port).await?,
+            Protocol::Socks4 => relay::socks4_dial(&ip, port, &target.host, target.port).await?,
+            Protocol::Http => {
+                let mut s = tokio::net::TcpStream::connect((ip.as_str(), port)).await?;
+                let req = format!(
+                    "GET http://{host}{path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: Mozilla/5.0 resi-fanout\r\nConnection: close\r\n\r\n",
+                    host = target.host, path = target.path
+                );
+                s.write_all(req.as_bytes()).await?;
+                let buf = read_to_eof(&mut s).await?;
+                return finish(&buf, &target);
+            }
+        };
+        raw_check(&mut s, &target).await
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(Ok(Some(exit))) => Some((exit, start.elapsed().as_millis() as u64)),
+        _ => None,
+    }
+}
+
 /// Classify the exit of a local OpenVPN tunnel: connect with the socket
 /// bound to the tunnel IP and run the same classifier request.
 /// Returns (exit info, latency) or None.

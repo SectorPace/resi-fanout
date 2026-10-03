@@ -239,6 +239,11 @@ pub struct WarpCfg {
     pub license: String,
     pub keepalive: u64,
     pub mtu: u64,
+    /// Mihomo sidecar (used for MASQUE nodes Clash-style, which are not
+    /// plain WireGuard). Its mixed-port becomes another fanout port.
+    pub mihomo_bin: String,
+    pub mihomo_port: u16,
+    pub mihomo_conf: String,
 }
 
 impl Default for WarpCfg {
@@ -252,6 +257,9 @@ impl Default for WarpCfg {
             license: String::new(),
             keepalive: 60,
             mtu: 1280,
+            mihomo_bin: "mihomo".into(),
+            mihomo_port: 22100,
+            mihomo_conf: "/var/lib/resi-fanout/masque/mihomo.yaml".into(),
         }
     }
 }

@@ -360,7 +360,7 @@ pub async fn run_cycle(state: &Arc<AppState>) {
         }),
     )
     .await;
-    add_port_entry(state, cfg.warp.local_port).await;
+    add_tunnel_entry(state, cfg.warp.local_port, "warp", "cloudflare-warp").await;
 }
 
 async fn tun_ip_of(iface: &str) -> Option<std::net::IpAddr> {
@@ -375,15 +375,15 @@ async fn tun_ip_of(iface: &str) -> Option<std::net::IpAddr> {
     parts.get(idx + 1)?.split('/').next()?.parse().ok()
 }
 
-async fn add_port_entry(state: &Arc<AppState>, port: u16) {
+async fn add_tunnel_entry(state: &Arc<AppState>, port: u16, key: &str, hostname: &str) {
     // reuse the tunnel list so /api/ports and 3x-ui linking pick it up
     let mut tunnels = state.vpn_tunnels.write().await;
     if let Some(t) = tunnels.iter_mut().find(|t| t.local_port == port) {
         t.status = "up".into();
     } else {
         tunnels.push(crate::models::VpnTunnel {
-            server_key: "warp".into(),
-            hostname: "cloudflare-warp".into(),
+            server_key: key.into(),
+            hostname: hostname.into(),
             local_port: port,
             status: "up".into(),
             attempts: 0,
@@ -392,6 +392,16 @@ async fn add_port_entry(state: &Arc<AppState>, port: u16) {
             ..Default::default()
         });
     }
+}
+
+/// strip local port entries when disabled
+pub async fn clear_ports(state: &Arc<AppState>) {
+    let cfg = state.config().await;
+    let mut tunnels = state.vpn_tunnels.write().await;
+    tunnels.retain(|t| {
+        !((t.server_key == "warp" && t.local_port == cfg.warp.local_port)
+            || (t.server_key == "masque" && t.local_port == cfg.warp.mihomo_port))
+    });
 }
 
 /// idempotent listener for the tunnel's SOCKS port
@@ -444,11 +454,334 @@ pub async fn xray_outbound(state: &Arc<AppState>) -> Result<Value, String> {
     }))
 }
 
-/// strip local port entry when disabled
-pub async fn clear_port(state: &Arc<AppState>) {
+/// Apply a Clash/Mihomo node in one of two ways:
+/// * "wireguard" — save the credentials as our WireGuard profile (wg-quick);
+/// * "masque"    — write a self-contained Mihomo config and let the sidecar
+///                  expose a local socks port (native MASQUE support).
+pub async fn apply_clash(
+    state: &Arc<AppState>,
+    yaml: &str,
+    index: usize,
+    mode: &str,
+) -> Result<Value, String> {
+    let nodes = parse_clash(yaml);
+    let Some(node) = nodes.get(index) else {
+        return Err(format!("no masque/wireguard node at index {index}"));
+    };
     let cfg = state.config().await;
-    let mut tunnels = state.vpn_tunnels.write().await;
-    tunnels.retain(|t| t.local_port != cfg.warp.local_port || t.server_key != "warp");
+    match mode {
+        "masque" => {
+            let conf = clash_to_mihomo(node, cfg.warp.mihomo_port);
+            let path = PathBuf::from(&cfg.warp.mihomo_conf);
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+            }
+            tokio::fs::write(&path, conf).await.map_err(|e| e.to_string())?;
+            // restart sidecar with the new node
+            let taken = {
+                MASQUE_SLOT
+                    .get_or_init(|| std::sync::Mutex::new(None))
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take()
+            };
+            if let Some(mut c) = taken {
+                let _ = c.kill().await;
+            }
+            let started = match start_masque(&cfg, state.clone()).await {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!(error = %e, "mihomo sidecar not started");
+                    false
+                }
+            };
+            Ok(json!({
+                "ok": true, "mode": "masque", "node": node.name,
+                "conf": cfg.warp.mihomo_conf, "port": cfg.warp.mihomo_port,
+                "sidecar_started": started,
+                "hint": if started { String::new() } else { format!("run: {} -f {}", cfg.warp.mihomo_bin, cfg.warp.mihomo_conf) }
+            }))
+        }
+        _ => {
+            let conf = clash_to_wireguard(node, cfg.warp.keepalive, cfg.warp.mtu)?;
+            let p = import_profile(state, &conf).await?;
+            Ok(json!({
+                "ok": true, "mode": "wireguard", "node": node.name,
+                "endpoint": p.endpoint, "addresses": p.addresses,
+                "hint": "saved as the WARP profile — press 连接 to bring the tunnel up"
+            }))
+        }
+    }
+}
+
+// ------------------------------------------------------------ Clash / Mihomo import
+
+/// A `masque` / `wireguard` node lifted out of a Clash or Mihomo config.
+#[derive(Clone, Debug, Serialize, Default)]
+pub struct ClashNode {
+    pub name: String,
+    pub kind: String,
+    pub server: String,
+    pub port: u16,
+    /// verbatim values from the yaml — Mihomo needs these exactly as-is
+    pub private_key: String,
+    pub public_key: String,
+    /// plain 32-byte keys, only when the blob is unambiguous
+    pub wg_private_key: Option<String>,
+    pub wg_public_key: Option<String>,
+    pub ip: Option<String>,
+    pub ipv6: Option<String>,
+    pub mtu: Option<u64>,
+    pub sni: Option<String>,
+    pub dns: Vec<String>,
+    pub udp: bool,
+}
+
+impl ClashNode {
+    pub fn addresses(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        if let Some(ip) = &self.ip {
+            if !ip.is_empty() {
+                v.push(ip.clone());
+            }
+        }
+        if let Some(ip6) = &self.ipv6 {
+            if !ip6.is_empty() {
+                v.push(ip6.clone());
+            }
+        }
+        v
+    }
+}
+
+fn copy32(src: &[u8]) -> [u8; 32] {
+    let mut k = [0u8; 32];
+    k.copy_from_slice(&src[..32]);
+    k
+}
+
+/// Non-recursive DER TLV scan: collect every 32-byte key chunk we can find
+/// (raw OCTET STRINGs, and BIT STRINGs that carry no unused bits). Clash
+/// wraps WARP keys in PKCS#8 / SPKI DER, plain WireGuard configs use the
+/// raw 32-byte form.
+fn der_candidates(buf: &[u8]) -> Vec<[u8; 32]> {
+    let mut out: Vec<[u8; 32]> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = vec![(0, buf.len())];
+    while let Some((start, end)) = ranges.pop() {
+        if start >= end {
+            continue;
+        }
+        let mut i = start;
+        while i + 2 <= end {
+            let tag = buf[i];
+            let first = buf[i + 1];
+            let mut p = i + 2;
+            let len: usize;
+            if first & 0x80 != 0 {
+                let n = (first & 0x7f) as usize;
+                if n == 0 || n > 4 || p + n > end {
+                    break;
+                }
+                let mut v: usize = 0;
+                for k in 0..n {
+                    v = (v << 8) | buf[p + k] as usize;
+                }
+                p += n;
+                len = v;
+            } else {
+                len = first as usize;
+            }
+            if len > end - p {
+                break;
+            }
+            if len == 32 {
+                out.push(copy32(&buf[p..p + 32]));
+            } else if len == 33 && buf[p] == 0 {
+                out.push(copy32(&buf[p + 1..p + 33]));
+            }
+            if tag & 0x20 != 0 {
+                ranges.push((p, p + len));
+            }
+            i = p + len;
+        }
+    }
+    out
+}
+
+pub fn normalize_key(b64: &str) -> Option<String> {
+    use base64::Engine as _;
+    let trimmed = b64.trim();
+    let raw = match base64::engine::general_purpose::STANDARD.decode(trimmed) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, len = trimmed.len(), head = %trimmed.chars().take(24).collect::<String>(), "key base64 decode failed");
+            return None;
+        }
+    };
+    if raw.len() == 32 {
+        return Some(trimmed.to_string());
+    }
+    let cands = der_candidates(&raw);
+    if cands.is_empty() {
+        warn!(raw_len = raw.len(), head = hex_head(&raw), "no 32-byte chunk found in key blob");
+        return None;
+    }
+    Some(base64::engine::general_purpose::STANDARD.encode(cands[0]))
+}
+
+fn hex_head(raw: &[u8]) -> String {
+    raw.iter().take(20).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("")
+}
+
+/// Extract the top-level `proxies:` block as text. Clash configs use YAML
+/// anchors/merge keys (`<<: *domain`) further down, which serde_yaml rejects
+/// outright — so we never try to parse the whole document.
+fn extract_proxies_block(yaml: &str) -> Option<String> {
+    let mut lines = yaml.lines();
+    lines.position(|l| {
+        let t = l.trim_end();
+        t == "proxies:" || t.starts_with("proxies: ")
+    })?;
+    let mut body: Vec<&str> = Vec::new();
+    for line in lines {
+        // a new top-level key ends the block
+        let t = line.trim_end();
+        if !t.is_empty() && !t.starts_with(' ') && !t.starts_with('\t') && t.contains(':') {
+            break;
+        }
+        body.push(line);
+    }
+    if body.is_empty() {
+        return None;
+    }
+    Some(body.join("\n"))
+}
+
+/// Extract every masque / wireguard node from a Clash or Mihomo YAML.
+pub fn parse_clash(yaml: &str) -> Vec<ClashNode> {
+    let block = extract_proxies_block(yaml);
+    let doc: serde_yaml::Value = match block.as_deref().map(serde_yaml::from_str) {
+        Some(Ok(v)) => v,
+        _ => match serde_yaml::from_str(yaml) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "clash yaml parse failed");
+                return vec![];
+            }
+        },
+    };
+    let seq = doc
+        .as_sequence()
+        .map(|s| s.clone())
+        .or_else(|| doc.get("proxies").and_then(|p| p.as_sequence()).cloned())
+        .unwrap_or_default();
+    let proxies = seq;
+    let s = |m: &serde_yaml::Mapping, k: &str| -> Option<String> {
+        m.get(serde_yaml::Value::String(k.into()))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+    // Clash writes `port: 443` / `mtu: 1280` as numbers, not strings
+    let num = |m: &serde_yaml::Mapping, k: &str| -> Option<u64> {
+        let v = m.get(serde_yaml::Value::String(k.into()))?;
+        v.as_u64().or_else(|| v.as_str().and_then(|x| x.parse().ok()))
+    };
+    let mut out = Vec::new();
+    for p in proxies {
+        let Some(m) = p.as_mapping() else { continue };
+        let kind = s(m, "type").unwrap_or_default().to_lowercase();
+        if kind != "masque" && kind != "wireguard" {
+            continue;
+        }
+        let Some(priv_raw) = s(m, "private-key") else { continue };
+        let Some(pub_raw) = s(m, "public-key") else { continue };
+        // MASQUE keys are Cloudflare multi-algorithm containers (X25519+X448)
+        // that only Mihomo can consume; keep them verbatim and mark whether a
+        // plain-wireguard extraction was unambiguous.
+        let wg_private_key = normalize_key(&priv_raw);
+        let wg_public_key = normalize_key(&pub_raw);
+        out.push(ClashNode {
+            name: s(m, "name").unwrap_or_else(|| format!("{kind} node")),
+            kind,
+            server: s(m, "server").unwrap_or_default(),
+            port: num(m, "port").unwrap_or(0) as u16,
+            private_key: priv_raw,
+            public_key: pub_raw,
+            wg_private_key,
+            wg_public_key,
+            ip: s(m, "ip"),
+            ipv6: s(m, "ipv6"),
+            mtu: num(m, "mtu"),
+            sni: s(m, "sni"),
+            dns: m
+                .get(serde_yaml::Value::String("dns".into()))
+                .and_then(|v| v.as_sequence())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            udp: m
+                .get(serde_yaml::Value::String("udp".into()))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        });
+    }
+    out
+}
+
+/// Route 1: the node's WARP credentials as a plain WireGuard config.
+pub fn clash_to_wireguard(node: &ClashNode, keepalive: u64, mtu: u64) -> Result<String, String> {
+    let (Some(priv_key), Some(pub_key)) = (&node.wg_private_key, &node.wg_public_key) else {
+        return Err("this node carries Cloudflare multi-algorithm keys, not plain WireGuard keys — import it as MASQUE (Mihomo) instead".into());
+    };
+    let mut ips = node.addresses();
+    if ips.is_empty() {
+        ips.push("172.16.0.2/32".into());
+    }
+    Ok(format!(
+        "[Interface]\nPrivateKey = {}\nAddress = {}\nMTU = {}\n\n[Peer]\nPublicKey = {}\nEndpoint = engage.cloudflareclient.com:2408\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = {}\n",
+        priv_key,
+        ips.join(", "),
+        if mtu > 0 { mtu } else { node.mtu.unwrap_or(1280) },
+        pub_key,
+        if keepalive > 0 { keepalive } else { 60 },
+    ))
+}
+
+/// Route 2: a self-contained Mihomo config that speaks MASQUE natively and
+/// exposes a local socks port our fanout can dial through.
+pub fn clash_to_mihomo(node: &ClashNode, port: u16) -> String {
+    use serde_json::json;
+    let proxy = json!({
+        "name": node.name,
+        "type": node.kind,
+        "server": node.server,
+        "port": node.port,
+        "private-key": node.private_key,
+        "public-key": node.public_key,
+        "ip": node.ip.clone().unwrap_or_else(|| "172.16.0.2/32".into()),
+        "ipv6": node.ipv6.clone().unwrap_or_default(),
+        "mtu": node.mtu.unwrap_or(1280),
+        "udp": node.udp,
+        "sni": node.sni.clone().unwrap_or_else(|| "www.microsoft.com".into()),
+        "remote-dns-resolve": true,
+        "dns": node.dns.clone(),
+    });
+    let doc = json!({
+        "mixed-port": port,
+        "allow-lan": false,
+        "mode": "global",
+        "log-level": "warning",
+        "ipv6": true,
+        "proxies": [proxy],
+        "proxy-groups": [
+            { "name": "GLOBAL", "type": "select", "proxies": [node.name.clone()] }
+        ],
+        "rules": ["MATCH,GLOBAL"]
+    });
+    serde_yaml::to_string(&doc).unwrap_or_default()
 }
 
 pub fn supervisor(state: Arc<AppState>) {
@@ -460,14 +793,160 @@ pub fn supervisor(state: Arc<AppState>) {
             tick.tick().await;
             let cfg = state.config().await;
             if !cfg.warp.enabled {
-                if was_enabled.swap(false, Ordering::SeqCst) && interface_exists(&cfg.warp.interface).await {
-                    disconnect(&state).await;
+                if was_enabled.swap(false, Ordering::SeqCst) {
+                    if interface_exists(&cfg.warp.interface).await {
+                        disconnect(&state).await;
+                    }
+                    let taken = {
+                        MASQUE_SLOT
+                            .get_or_init(|| std::sync::Mutex::new(None))
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .take()
+                    };
+                    if let Some(mut c) = taken {
+                        let _ = c.kill().await;
+                    }
                 }
-                clear_port(&state).await;
+                clear_ports(&state).await;
                 continue;
             }
             was_enabled.store(true, Ordering::SeqCst);
             run_cycle(&state).await;
+
+            // keep the MASQUE sidecar alive when one is configured
+            let (alive, cfg_port) = {
+                let mut guard = MASQUE_SLOT
+                    .get_or_init(|| std::sync::Mutex::new(None))
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let alive = match guard.as_mut() {
+                    Some(c) => matches!(c.try_wait(), Ok(None)),
+                    None => false,
+                };
+                (alive, cfg.warp.mihomo_port)
+            };
+            if tokio::fs::metadata(&cfg.warp.mihomo_conf).await.map(|m| m.len() > 0).unwrap_or(false) {
+                if !alive {
+                    match start_masque(&cfg, state.clone()).await {
+                        Ok(()) => info!("masque sidecar started"),
+                        Err(e) => warn!(error = %e, "masque sidecar start failed"),
+                    }
+                } else {
+                    ensure_proxy_listener(&state, cfg_port).await;
+                    classify_masque(&state, cfg_port).await;
+                }
+            }
         }
     });
+}
+
+async fn start_masque(cfg: &crate::config::Config, state: Arc<AppState>) -> Result<(), String> {
+    if which(&cfg.warp.mihomo_bin).is_none() {
+        return Err(format!("{} not installed", cfg.warp.mihomo_bin));
+    }
+    let conf = PathBuf::from(&cfg.warp.mihomo_conf);
+    if let Some(parent) = conf.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+    }
+    let child = Command::new(&cfg.warp.mihomo_bin)
+        .args([
+            "-d",
+            conf.parent().unwrap_or(Path::new(".")).to_string_lossy().as_ref(),
+            "-f",
+            conf.to_string_lossy().as_ref(),
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(false)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let slot = MASQUE_SLOT.get_or_init(|| std::sync::Mutex::new(None));
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+    // give it a moment to bind before we dial
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    ensure_proxy_listener(&state, cfg.warp.mihomo_port).await;
+    classify_masque(&state, cfg.warp.mihomo_port).await;
+    Ok(())
+}
+
+static MASQUE_SLOT: std::sync::OnceLock<std::sync::Mutex<Option<tokio::process::Child>>> =
+    std::sync::OnceLock::new();
+
+/// Expose the MASQUE sidecar's local socks port as a fanout port.
+async fn ensure_proxy_listener(state: &Arc<AppState>, port: u16) {
+    static PROXY_LISTENERS: std::sync::OnceLock<std::sync::Mutex<Vec<u16>>> =
+        std::sync::OnceLock::new();
+    let set = PROXY_LISTENERS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    {
+        let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.contains(&port) {
+            return;
+        }
+        guard.push(port);
+    }
+    let st = state.clone();
+    let dialer = Dialer::Proxy(format!("socks5://127.0.0.1:{port}"));
+    tokio::spawn(async move {
+        let _ = relay::run_listener(st.clone(), port, dialer).await;
+    });
+    info!(port, "masque fanout port listening");
+}
+
+async fn classify_masque(state: &Arc<AppState>, port: u16) {
+    let cfg = state.config().await;
+    // throttle: only re-classify every 10 minutes
+    if let Ok(text) = tokio::fs::read_to_string(state.data_dir.join("warp").join("masque.json")).await {
+        if let Ok(v) = serde_json::from_str::<Value>(&text) {
+            if let Some(ts) = v.get("last_check").and_then(|x| x.as_i64()) {
+                if now_ts() - ts < 600 {
+                    return;
+                }
+            }
+        }
+    }
+    let key = format!("socks5://127.0.0.1:{port}");
+    if let Some((exit, latency)) = crate::checker::classify_via_proxy(&key, &cfg).await {
+        let dir = state.data_dir.join("warp");
+        let _ = tokio::fs::create_dir_all(&dir).await;
+        let _ = tokio::fs::write(
+            dir.join("masque.json"),
+            json!({
+                "exit_ip": exit.ip, "country": exit.country, "country_code": exit.country_code,
+                "isp": exit.isp, "hosting": exit.hosting, "latency_ms": latency,
+                "port": port, "last_check": now_ts()
+            })
+            .to_string(),
+        )
+        .await;
+        info!(%exit.ip, country = ?exit.country_code, latency, "masque exit classified");
+        add_tunnel_entry(state, port, "masque", "masque-node").await;
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_clash_keys() {
+        let priv_clash = "MHcCAQEEIOTDZ2O+jojF/i+gswHEZW8RVLYQ8YrAcKMOOSy+Nz4DoAoGCCqGSM49AwEHoUQDQgAEkNQD0H3ZhQD+/UrHTKZMdERrJeRS9j3y4WPgLni5sbfyLJLyT9PJI8s0DDiM1j40S17Nv1Kdk3SzG9Af7UrE4w==";
+        let pub_clash = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG7SxI8tsW8OR1A5tv/zCzVbCRRh2t87/kxnP6lAy0lkr7qYwu+ox+k3dr6w==";
+        // the private blob's OCTET STRING(32) is the X25519 private key ...
+        assert_eq!(
+            normalize_key(priv_clash).as_deref(),
+            Some("5MNnY76OiMX+L6CzAcRlbxFUthDxisBwow45LL43PgM=")
+        );
+        // ... but the public blob holds multi-algorithm material, so we must
+        // not silently hand a random chunk out as "the key"
+        assert_eq!(normalize_key(pub_clash), None);
+    }
+
+    #[test]
+    fn keeps_raw_32_byte_keys() {
+        assert_eq!(
+            normalize_key("5MNnY76OiMX+L6CzAcRlbxFUthDxisBwow45LL43PgM=").as_deref(),
+            Some("5MNnY76OiMX+L6CzAcRlbxFUthDxisBwow45LL43PgM=")
+        );
+    }
 }

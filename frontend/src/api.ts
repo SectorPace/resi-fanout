@@ -167,6 +167,17 @@ async function req(method: string, path: string, body?: unknown): Promise<any> {
   return res.json();
 }
 
+export interface ClashNode {
+  index: number;
+  name: string;
+  kind: string;
+  server: string;
+  port: number;
+  addresses: string[];
+  mtu?: number | null;
+  sni?: string | null;
+}
+
 export interface WarpStatus {
   enabled: boolean;
   profile_present: boolean;
@@ -210,7 +221,15 @@ export const api = {
   warpImport: (config: string): Promise<{ ok: boolean; endpoint?: string; msg: string }> =>
     req("POST", "/api/warp/import", { config }),
   warpConnect: (): Promise<{ ok: boolean; msg: string }> => req("POST", "/api/warp/connect"),
-  warpDisconnect: (): Promise<{ ok: boolean; msg: string }> => req("POST", "/api/warp/disconnect")
+  warpDisconnect: (): Promise<{ ok: boolean; msg: string }> => req("POST", "/api/warp/disconnect"),
+  warpImportClash: (yaml: string): Promise<{ ok: boolean; count: number; nodes: ClashNode[] }> =>
+    req("POST", "/api/warp/import-clash", { yaml }),
+  warpApplyClash: (
+    yaml: string,
+    index: number,
+    mode: "masque" | "wireguard"
+  ): Promise<{ ok: boolean; mode: string; node?: string; port?: number; hint?: string; sidecar_started?: boolean }> =>
+    req("POST", "/api/warp/apply-clash", { yaml, index, mode })
 };
 
 export interface Snippet {

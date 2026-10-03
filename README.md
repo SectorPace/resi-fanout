@@ -178,6 +178,22 @@ UI 还会**生成 Xray 原生 wireguard 出站**（就是上面那份配置转�
       "allowedIPs": ["0.0.0.0/0", "::/0"], "keepAlive": 60 }] } }
 ```
 
+### 从 Clash / Mihomo 配置导入 MASQUE 节点
+
+新版 WARP 还有 MASQUE 传输（HTTP/3 CONNECT-UDP），在 Clash/Mihomo 里是 `type: masque`。UI「VPN Gate」页有导入框：把配置里的 `proxies` 段整段粘进去 → 解析节点 → 选一个 → **按 MASQUE 应用**。
+
+```bash
+sudo bash install.sh --with-masque   # 顺便下载 mihomo（原生 MASQUE 实现）
+```
+
+要点：
+
+- **MASQUE 节点的密钥是 Cloudflare 的多算法容器**（DER 里同时带 X25519 与 X448），只有 Mihomo 能正确消费，所以这类节点一律走 Mihomo 旁挂：resi-fanout 生成一份只含该节点的最小 mihomo 配置、拉起 mihomo，它的 mixed-port 就成为一个新的本地出口端口（默认 `22100`），同样进入 3x-ui 入站联动。
+- 导入时密钥**原样保留**（逐字节透传，不做任何改写），避免破坏 Cloudflare 的密钥格式；这类节点选「按 WireGuard 应用」会被明确拒绝，因为容器里取不出标准 WireGuard 密钥对。
+- 如果你粘的是普通 `type: wireguard` 节点（32 字节裸密钥），可以直接「按 WireGuard 应用」，走 wg-quick 隧道那条路。
+- 解析器只取顶层 `proxies:` 段单独解析——Clash 配置里的 YAML 锚点/合并键（`<<: *domain`）会让整篇解析失败。
+
+
 ## 配置说明（config.json）
 
 | 字段 | 默认 | 说明 |

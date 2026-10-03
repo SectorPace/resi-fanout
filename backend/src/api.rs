@@ -40,6 +40,8 @@ pub fn router(state: Arc<AppState>, web_root: &str) -> Router {
         .route("/warp/import", post(warp_import))
         .route("/warp/connect", post(warp_connect))
         .route("/warp/disconnect", post(warp_disconnect))
+        .route("/warp/import-clash", post(warp_import_clash))
+        .route("/warp/apply-clash", post(warp_apply_clash))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth));
 
     let mut app = Router::new().nest("/api", api);
@@ -267,6 +269,66 @@ async fn warp_connect(State(state): State<Arc<AppState>>) -> Response {
 async fn warp_disconnect(State(state): State<Arc<AppState>>) -> Response {
     crate::warp::disconnect(&state).await;
     Json(json!({ "ok": true, "msg": "warp tunnel down" })).into_response()
+}
+
+/// Parse a Clash/Mihomo YAML and list every masque/wireguard node with the
+/// two conversions we support (wireguard profile / mihomo sidecar config).
+async fn warp_import_clash(body: Option<Json<Value>>) -> Response {
+    let yaml = body
+        .as_ref()
+        .and_then(|b| b.0.get("yaml"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if yaml.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "paste a clash/mihomo yaml").into_response();
+    }
+    let nodes = crate::warp::parse_clash(yaml);
+    if nodes.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "no masque/wireguard proxies found in that yaml",
+        )
+            .into_response();
+    }
+    let list: Vec<Value> = nodes
+        .iter()
+        .enumerate()
+        .map(|(i, n)| {
+            json!({
+                "index": i, "name": n.name, "kind": n.kind,
+                "server": n.server, "port": n.port,
+                "addresses": n.addresses(), "mtu": n.mtu, "sni": n.sni,
+                "public_key": n.public_key,
+            })
+        })
+        .collect();
+    Json(json!({ "ok": true, "count": nodes.len(), "nodes": list }))
+        .into_response()
+}
+
+async fn warp_apply_clash(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let yaml = body
+        .as_ref()
+        .and_then(|b| b.0.get("yaml"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let index = body
+        .as_ref()
+        .and_then(|b| b.0.get("index"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as usize;
+    let mode = body
+        .as_ref()
+        .and_then(|b| b.0.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("wireguard");
+    match crate::warp::apply_clash(&state, yaml, index, mode).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
 }
 
 async fn ports(State(state): State<Arc<AppState>>) -> Response {
