@@ -2,7 +2,14 @@
   "server": {
     "listen": "127.0.0.1:7654",
     "api_key": "__API_KEY__",
-    "web_root": "/opt/resi-fanout/web"
+    "web_root": "/opt/resi-fanout/web",
+    "base_path": "",
+    "tls": {
+      "enabled": false,
+      "cert_path": "/etc/resi-fanout/tls/fullchain.pem",
+      "key_path": "/etc/resi-fanout/tls/privkey.pem",
+      "reload_secs": 300
+    }
   },
   "fanout": {
     "bind": "127.0.0.1",

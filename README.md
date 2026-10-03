@@ -118,7 +118,30 @@ bash scripts/3xui-push.sh --key <KEY> --residential \
 curl --socks5-hostname 127.0.0.1:20000 http://ip-api.com/json
 ```
 
-## VPN Gate 隧道（可选）
+## 公网访问 + ACME IP 证书
+
+想让 UI/API 从公网访问，推荐用 **ACME 签发的 IP 证书**（Let's Encrypt 从 2026-01 起已正式开放 IP 证书，6 天有效期）：
+
+```bash
+sudo bash install.sh --with-tls
+```
+
+它会做这些事：
+
+- 探测公网 IP，安装 [lego](https://github.com/go-acme/lego)（支持 RFC 8738 IP 证书），向 Let's Encrypt 申请 **面向 IP 的证书**（HTTP-01，需要 80 端口能从公网访问；失败会给出手动/DNS-01 提示）；
+- 证书落到 `/etc/resi-fanout/tls/{fullchain.pem,privkey.pem}`，服务直接跑 HTTPS（axum 0.7 没有 TLS，TLS 层我们自己用 rustls 实现）；
+- **证书热重载**：6 天证书会被频繁替换，服务每 5 分钟检查文件变化，换证书不用重启、不断连接；
+- 注册 `resi-fanout-acme.timer` 每 12 小时自动续期；
+- 自动生成**随机访问路径**（如 `/Kf3x9a71`）并监听 `0.0.0.0`，访问 `https://<你的IP>:端口/随机路径`。
+
+暴露公网时请注意：
+
+- 一定保留安装时生成的 **API Key**（所有 `/api` 请求都要 `Authorization: Bearer <key>`）；
+- 随机路径只是减少被扫描发现，**不能替代鉴权**；
+- 端口不一定要开 443：`--port 7654` 可以任选，但要记得在防火墙/安全组放行；
+- 也可以完全手工：把任意证书路径填进 `server.tls` 后重启服务即可。
+
+
 
 [VPN Gate](https://www.vpngate.net) 是筑波大学的学术实验项目，公共中继里包含大量**家庭宽带的志愿者节点**（日本/韩国/美国尤多），适合补充海外住宅线路。开启后每台选中的服务器会拉起一条 OpenVPN 旁挂隧道，**每条隧道一个本地 SOCKS 端口**（默认 `21000+`），与代理端口一起统一接入 3x-ui。
 

@@ -11,6 +11,8 @@ mod scheduler;
 mod snippet;
 mod sources;
 mod state;
+#[cfg(feature = "tls")]
+mod tls;
 mod vpngate;
 mod warp;
 mod xui;

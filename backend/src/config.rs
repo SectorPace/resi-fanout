@@ -13,6 +13,30 @@ pub enum FanoutMode {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
+pub struct TlsCfg {
+    pub enabled: bool,
+    /// PEM chain (fullchain.pem)
+    pub cert_path: String,
+    /// PEM private key (privkey.pem)
+    pub key_path: String,
+    /// how often to check whether the files changed (short-lived IP certs
+    /// are reissued every few days, so reload without a restart)
+    pub reload_secs: u64,
+}
+
+impl Default for TlsCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cert_path: "/etc/resi-fanout/tls/fullchain.pem".into(),
+            key_path: "/etc/resi-fanout/tls/privkey.pem".into(),
+            reload_secs: 300,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerCfg {
     /// API + web UI listen address. Keep 127.0.0.1 unless you protect it.
     pub listen: String,
@@ -20,6 +44,9 @@ pub struct ServerCfg {
     pub api_key: String,
     /// Directory with the built frontend (index.html). Empty string disables UI.
     pub web_root: String,
+    /// Random URL prefix, e.g. "/Kf3x9". Empty = serve at the root.
+    pub base_path: String,
+    pub tls: TlsCfg,
 }
 
 impl Default for ServerCfg {
@@ -28,6 +55,8 @@ impl Default for ServerCfg {
             listen: "127.0.0.1:7654".into(),
             api_key: String::new(),
             web_root: "web".into(),
+            base_path: String::new(),
+            tls: TlsCfg::default(),
         }
     }
 }

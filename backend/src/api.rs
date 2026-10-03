@@ -20,7 +20,18 @@ use crate::state::AppState;
 
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub fn router(state: Arc<AppState>, web_root: &str) -> Router {
+/// Normalise "/foo", "foo/" → "/foo" (empty stays empty).
+pub fn normalize_base(p: &str) -> String {
+    let t = p.trim().trim_matches('/');
+    if t.is_empty() {
+        String::new()
+    } else {
+        format!("/{t}")
+    }
+}
+
+pub fn router(state: Arc<AppState>, web_root: &str, base_path: &str) -> Router {
+    let base = normalize_base(base_path);
     let api = Router::new()
         .route("/status", get(status))
         .route("/proxies", get(proxies))
@@ -44,11 +55,51 @@ pub fn router(state: Arc<AppState>, web_root: &str) -> Router {
         .route("/warp/apply-clash", post(warp_apply_clash))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth));
 
-    let mut app = Router::new().nest("/api", api);
-    if !web_root.is_empty() {
-        app = app.fallback_service(ServeDir::new(web_root));
+    if base.is_empty() {
+        let mut app = Router::new().nest("/api", api);
+        if !web_root.is_empty() {
+            app = app.fallback_service(
+                ServeDir::new(web_root).append_index_html_on_directories(true),
+            );
+        }
+        return app.with_state(state);
     }
-    app.with_state(state)
+
+    let mut app = Router::new().nest(&format!("{base}/api"), api);
+
+    // Under a base path the static files are served by our own routes:
+    // nest()'s catch-all does not match an empty remainder (so `/<base>/`
+    // would 404) and does not reach a nested fallback. MapRequest strips the
+    // prefix before ServeDir sees the request.
+    if !web_root.is_empty() {
+        let prefix = base.clone();
+        let static_files = tower::util::MapRequest::new(
+            ServeDir::new(web_root).append_index_html_on_directories(true),
+            move |mut req: axum::extract::Request| {
+                let path = req.uri().path().to_string();
+                let stripped = path.strip_prefix(&prefix).unwrap_or("");
+                let target = if stripped.is_empty() { "/" } else { stripped };
+                match target.parse() {
+                    Ok(uri) => *req.uri_mut() = uri,
+                    Err(_) => *req.uri_mut() = axum::http::Uri::from_static("/"),
+                }
+                req
+            },
+        );
+        app = app
+            .route(&format!("{base}/"), axum::routing::get_service(static_files.clone()))
+            .route(&format!("{base}/*path"), axum::routing::get_service(static_files));
+    }
+
+    let app = app
+        .route(
+            "/",
+            get(move || async move {
+                axum::response::Redirect::temporary(&format!("{base}/"))
+            }),
+        )
+        .with_state(state);
+    app
 }
 
 pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
@@ -57,9 +108,27 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
     if !web_root.is_empty() && !std::path::Path::new(&web_root).join("index.html").exists() {
         tracing::warn!(web_root, "web root has no index.html — UI will 404 (API still works)");
     }
-    let app = router(state.clone(), &web_root);
+    let base = normalize_base(&cfg.server.base_path);
+    let app = router(state.clone(), &web_root, &base);
     let listener = tokio::net::TcpListener::bind(&cfg.server.listen).await?;
-    tracing::info!(addr = %cfg.server.listen, "api/ui listening");
+    #[cfg(feature = "tls")]
+    let scheme = if cfg.server.tls.enabled { "https" } else { "http" };
+    #[cfg(not(feature = "tls"))]
+    let scheme = "http";
+    tracing::info!(
+        addr = %cfg.server.listen,
+        base = %base,
+        scheme,
+        "api/ui listening{}",
+        if cfg.server.api_key.is_empty() { " (WARNING: no API key)" } else { "" }
+    );
+
+    #[cfg(feature = "tls")]
+    if cfg.server.tls.enabled {
+        let handle = crate::tls::load(&cfg.server.tls).await?;
+        crate::tls::serve(handle, listener, app, cfg.server.tls.clone()).await?;
+        return Ok(());
+    }
     axum::serve(listener, app).await?;
     Ok(())
 }
