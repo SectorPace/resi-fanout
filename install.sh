@@ -226,10 +226,17 @@ if [ -n "${DIST}" ] && [ -f "${DIST}/index.html" ]; then
 fi
 
 if [ ! -f "${CONF_DIR}/config.json" ]; then
+  # source checkout keeps it under backend/, the release tarball puts it at
+  # the root of the extracted directory
+  CONF_EXAMPLE=""
+  for cand in "${SRC_DIR}/backend/config.example.json" "${SRC_DIR}/config.example.json"; do
+    if [ -f "${cand}" ]; then CONF_EXAMPLE="${cand}"; break; fi
+  done
+  [ -n "${CONF_EXAMPLE}" ] || die "config.example.json not found under ${SRC_DIR}"
   API_KEY="$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
   sed -e "s/__API_KEY__/${API_KEY}/" \
       -e "s|127.0.0.1:7654|127.0.0.1:${API_PORT}|" \
-      "${SRC_DIR}/backend/config.example.json" > "${CONF_DIR}/config.json"
+      "${CONF_EXAMPLE}" > "${CONF_DIR}/config.json"
   if [ "${WITH_VPNGATE}" = "1" ]; then
     python3 - "${CONF_DIR}/config.json" <<'PYEOF'
 import json, sys
