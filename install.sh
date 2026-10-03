@@ -19,6 +19,7 @@ SERVICE="${APP}.service"
 API_PORT="7654"
 WITH_3XUI="0"
 WITH_VPNGATE="0"
+WITH_WARP="0"
 REPO_URL="${REPO_URL:-https://github.com/SectorPace/resi-fanout.git}"
 GH_REPO="${GH_REPO:-SectorPace/resi-fanout}"
 NO_FRONTEND="0"
@@ -34,6 +35,7 @@ while [ $# -gt 0 ]; do
     --repo)       REPO_URL="${2:?}"; GH_REPO="${2#*github.com/}"; GH_REPO="${GH_REPO%.git}"; shift 2 ;;
     --with-3xui)  WITH_3XUI="1"; shift ;;
     --with-vpngate) WITH_VPNGATE="1"; shift ;;
+    --with-warp)   WITH_WARP="1"; shift ;;
     --from-source) FROM_SOURCE="1"; shift ;;
     --no-frontend) NO_FRONTEND="1"; shift ;;
     -h|--help)
@@ -118,6 +120,25 @@ if [ "${WITH_VPNGATE}" = "1" ]; then
   install_pkgs openvpn iproute2 || warn "openvpn install failed — VPN Gate tunnels will not start"
 fi
 
+if [ "${WITH_WARP}" = "1" ]; then
+  log "installing wireguard-tools (Cloudflare WARP tunnel)"
+  install_pkgs wireguard-tools iproute2 || warn "wireguard-tools install failed — WARP tunnel will not start"
+  if ! command -v wgcf >/dev/null 2>&1; then
+    log "downloading wgcf (official WARP profile generator)"
+    ARCH_WG="$(uname -m)"
+    case "${ARCH_WG}" in
+      x86_64)        WGURL="https://github.com/ViRb3/wgcf/releases/latest/download/wgcf_2.2.22_linux_amd64" ;;
+      aarch64|arm64) WGURL="https://github.com/ViRb3/wgcf/releases/latest/download/wgcf_2.2.22_linux_arm64" ;;
+      *)             WGURL="" ;;
+    esac
+    if [ -n "${WGURL}" ] && curl -fsSL "${WGURL}" -o /usr/local/bin/wgcf; then
+      chmod +x /usr/local/bin/wgcf
+    else
+      warn "wgcf download skipped — you can still paste a WireGuard config in the UI"
+    fi
+  fi
+fi
+
 # small VPS: make sure the Rust build doesn't OOM
 mem_kb=$(grep MemTotal /proc/meminfo 2>/dev/null | awk '{print $2}' || echo 999999999)
 if [ "${mem_kb:-999999999}" -lt 1000000 ] && ! swapon --show 2>/dev/null | grep -q .; then
@@ -181,7 +202,7 @@ fi
 log "installing to ${PREFIX}"
 install -d "${PREFIX}/bin" "${PREFIX}/web" "${PREFIX}/scripts" "${CONF_DIR}" "${DATA_DIR}"
 install -m 755 "${BINSRC}" "${PREFIX}/bin/${APP}"
-install -m 755 "${SRC_DIR}/scripts/3xui-push.sh" "${SRC_DIR}/scripts/vpn-up.sh" "${SRC_DIR}/scripts/vpn-down.sh" "${PREFIX}/scripts/" 2>/dev/null || true
+install -m 755 "${SRC_DIR}/scripts/3xui-push.sh" "${SRC_DIR}/scripts/vpn-up.sh" "${SRC_DIR}/scripts/vpn-down.sh" "${SRC_DIR}/scripts/warp-up.sh" "${SRC_DIR}/scripts/warp-down.sh" "${PREFIX}/scripts/" 2>/dev/null || true
 install -m 644 "${SRC_DIR}/scripts/xui_db.py" "${PREFIX}/scripts/xui_db.py" 2>/dev/null || true
 if [ -n "${DIST}" ] && [ -f "${DIST}/index.html" ]; then
   cp -r "${DIST}/." "${PREFIX}/web/"
@@ -198,6 +219,15 @@ import json, sys
 p = sys.argv[1]
 c = json.load(open(p))
 c["vpngate"]["enabled"] = True
+json.dump(c, open(p, "w"), indent=2, ensure_ascii=False)
+PYEOF
+  fi
+  if [ "${WITH_WARP}" = "1" ]; then
+    python3 - "${CONF_DIR}/config.json" <<'PYEOF'
+import json, sys
+p = sys.argv[1]
+c = json.load(open(p))
+c["warp"]["enabled"] = True
 json.dump(c, open(p, "w"), indent=2, ensure_ascii=False)
 PYEOF
   fi

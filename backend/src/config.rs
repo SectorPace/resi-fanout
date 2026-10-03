@@ -222,6 +222,40 @@ impl Default for XuiCfg {
     }
 }
 
+/// Cloudflare WARP (WireGuard) as an extra exit source.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WarpCfg {
+    pub enabled: bool,
+    /// WireGuard profile (wgcf output or a pasted config). Absolute path.
+    pub conf_path: String,
+    /// managed interface name
+    pub interface: String,
+    /// local SOCKS port for the tunnel
+    pub local_port: u16,
+    /// launch `wgcf register` when no profile exists yet
+    pub auto_register: bool,
+    /// WARP+ license (passed to `wgcf register --license <key>`)
+    pub license: String,
+    pub keepalive: u64,
+    pub mtu: u64,
+}
+
+impl Default for WarpCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            conf_path: "/var/lib/resi-fanout/warp/warp.conf".into(),
+            interface: "warp-rf".into(),
+            local_port: 22000,
+            auto_register: true,
+            license: String::new(),
+            keepalive: 60,
+            mtu: 1280,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -231,6 +265,7 @@ pub struct Config {
     pub scheduler: SchedulerCfg,
     pub filter: FilterCfg,
     pub vpngate: VpngateCfg,
+    pub warp: WarpCfg,
     pub xui: XuiCfg,
     pub sources: Vec<SourceCfg>,
 }
@@ -244,6 +279,7 @@ impl Default for Config {
             scheduler: SchedulerCfg::default(),
             filter: FilterCfg::default(),
             vpngate: VpngateCfg::default(),
+            warp: WarpCfg::default(),
             xui: XuiCfg::default(),
             sources: default_sources(),
         }

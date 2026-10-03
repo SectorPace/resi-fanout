@@ -248,10 +248,109 @@ export function renderVpngate(root: HTMLElement): void {
       }, "重新选点"),
       el("span", { id: "vg-hint", class: "dim" })
     ),
+    el(
+      "fieldset",
+      {},
+      el("legend", {}, "Cloudflare WARP（WireGuard 出口）"),
+      el("div", { id: "warp-status", class: "dim" }, "加载中…"),
+      el(
+        "div",
+        { class: "filterbar" },
+        el("input", { id: "warp-license", placeholder: "WARP+ 许可 key（可选）", style: "flex:1" }),
+        el("button", {
+          onclick: async () => {
+            const lic = (document.getElementById("warp-license") as HTMLInputElement).value.trim();
+            try {
+              const r = await api.warpRegister(lic || undefined);
+              toast(r.msg);
+              await loadWarp();
+            } catch (e) { toast(String(e), false); }
+          }
+        }, "用 wgcf 注册"),
+        el("button", {
+          onclick: async () => {
+            try {
+              await api.warpConnect();
+              toast("已拉起 WireGuard 隧道");
+              setTimeout(() => void loadWarp(), 3000);
+            } catch (e) { toast(String(e), false); }
+          }
+        }, "连接"),
+        el("button", {
+          onclick: async () => {
+            try {
+              await api.warpDisconnect();
+              toast("已断开");
+              await loadWarp();
+            } catch (e) { toast(String(e), false); }
+          }
+        }, "断开"),
+        el("button", {
+          onclick: () => {
+            const ob = (window as unknown as { __warpOutbound?: unknown }).__warpOutbound;
+            if (!ob) { toast("还没有 WARP 配置", false); return; }
+            const ta = document.getElementById("warp-out") as HTMLTextAreaElement | null;
+            if (ta) void navigator.clipboard.writeText(ta.value);
+          }
+        }, "复制 Xray 出站")
+      ),
+      el("textarea", {
+        id: "warp-config",
+        class: "code",
+        rows: "6",
+        style: "width:100%",
+        placeholder: "[Interface]\nPrivateKey = ...\nAddress = 172.16.0.2/32\n\n[Peer]\nPublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=\nEndpoint = engage.cloudflareclient.com:2408\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 60"
+      }, ""),
+      el(
+        "div",
+        { class: "actions" },
+        el("button", {
+          onclick: async () => {
+            const cfg = (document.getElementById("warp-config") as HTMLTextAreaElement).value;
+            try {
+              await api.warpImport(cfg);
+              toast("配置已保存，连接后生效");
+              await loadWarp();
+            } catch (e) { toast(String(e), false); }
+          }
+        }, "导入这份配置"),
+        el("small", { class: "dim" }, "支持 wgcf 生成的配置或手写 WireGuard 配置；私钥只存在本机 /var/lib/resi-fanout/warp/warp.conf")
+      ),
+      el("textarea", { id: "warp-out", class: "code", rows: "8", style: "width:100%;display:none" })
+    ),
     el("div", { id: "vg-tunnels" }),
     el("h3", {}, "候选服务器（按 Score 排序，前 50）"),
     el("div", { id: "vg-pool" })
   );
+
+  async function loadWarp(): Promise<void> {
+    const box = document.getElementById("warp-status");
+    const out = document.getElementById("warp-out") as HTMLTextAreaElement | null;
+    if (!box) return;
+    try {
+      const w = await api.warp();
+      const tools = [
+        w.tools.wg_quick ? "wg-quick ✓" : "wg-quick ✗",
+        w.tools.wgcf ? "wgcf ✓" : "wgcf ✗"
+      ].join(" · ");
+      const parts = [
+        `工具 ${tools}`,
+        `配置 ${w.profile_present ? "已导入" : "缺失"}`,
+        w.up ? `隧道已连接 (tun ${w.tun_ip ?? "?"})` : "隧道未连接",
+        w.exit_ip ? `出口 ${w.exit_ip} · ${w.country ?? "?"} · ${w.isp ?? "?"}${w.latency_ms != null ? ` · ${w.latency_ms}ms` : ""}` : "",
+        w.error ? `错误：${w.error}` : ""
+      ].filter(Boolean);
+      box.textContent = parts.join("  |  ");
+      if (w.xray_outbound && out) {
+        out.style.display = "";
+        out.value = JSON.stringify(w.xray_outbound, null, 2);
+        (window as unknown as { __warpOutbound?: unknown }).__warpOutbound = w.xray_outbound;
+      }
+    } catch (e) {
+      box.textContent = String(e);
+    }
+  }
+  void loadWarp();
 
   async function reload(): Promise<void> {
     let info: VpngateInfo;
@@ -332,7 +431,11 @@ export function renderVpngate(root: HTMLElement): void {
   }
 
   void reload();
-  const timer = window.setInterval(() => void reload(), 15000);
+  void loadWarp();
+  const timer = window.setInterval(() => {
+    void reload();
+    void loadWarp();
+  }, 15000);
   const obs = new MutationObserver(() => {
     if (!document.body.contains(root)) {
       window.clearInterval(timer);

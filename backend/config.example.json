@@ -40,6 +40,16 @@
     "max_pool": 800,
     "extra_urls": []
   },
+  "warp": {
+    "enabled": false,
+    "conf_path": "/var/lib/resi-fanout/warp/warp.conf",
+    "interface": "warp-rf",
+    "local_port": 22000,
+    "auto_register": true,
+    "license": "",
+    "keepalive": 60,
+    "mtu": 1280
+  },
   "xui": {
     "db_path": "/etc/x-ui/x-ui.db",
     "script_path": "/opt/resi-fanout/scripts/xui_db.py",

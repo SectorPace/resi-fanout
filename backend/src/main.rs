@@ -12,6 +12,7 @@ mod snippet;
 mod sources;
 mod state;
 mod vpngate;
+mod warp;
 mod xui;
 
 use std::path::PathBuf;
@@ -100,6 +101,7 @@ async fn main() -> anyhow::Result<()> {
         "serve" => {
             relay::spawn_supervisor(state.clone());
             openvpn::spawn_supervisor(state.clone());
+            warp::supervisor(state.clone());
             scheduler::spawn(state.clone());
             api::serve(state).await?;
         }

@@ -167,6 +167,24 @@ async function req(method: string, path: string, body?: unknown): Promise<any> {
   return res.json();
 }
 
+export interface WarpStatus {
+  enabled: boolean;
+  profile_present: boolean;
+  tools: { wg_quick: boolean; wg: boolean; wgcf: boolean };
+  up: boolean;
+  tun_ip?: string | null;
+  local_port: number;
+  exit_ip?: string | null;
+  country?: string | null;
+  country_code?: string | null;
+  isp?: string | null;
+  latency_ms?: number | null;
+  hosting?: boolean | null;
+  last_check?: number | null;
+  error?: string | null;
+  xray_outbound?: unknown;
+}
+
 export const api = {
   status: (): Promise<Status> => req("GET", "/api/status"),
   proxies: (query: string): Promise<{ total: number; items: ProxyItem[] }> =>
@@ -185,7 +203,14 @@ export const api = {
     req("POST", "/api/xui/preview", body),
   xuiLink: (body: { template_id: number; ports?: number[]; residential_only?: boolean; host?: string }): Promise<XuiInfo> =>
     req("POST", "/api/xui/link", body),
-  xuiUnlink: (): Promise<XuiInfo> => req("POST", "/api/xui/unlink")
+  xuiUnlink: (): Promise<XuiInfo> => req("POST", "/api/xui/unlink"),
+  warp: (): Promise<WarpStatus> => req("GET", "/api/warp"),
+  warpRegister: (license?: string): Promise<{ ok: boolean; msg: string }> =>
+    req("POST", "/api/warp/register", license ? { license } : {}),
+  warpImport: (config: string): Promise<{ ok: boolean; endpoint?: string; msg: string }> =>
+    req("POST", "/api/warp/import", { config }),
+  warpConnect: (): Promise<{ ok: boolean; msg: string }> => req("POST", "/api/warp/connect"),
+  warpDisconnect: (): Promise<{ ok: boolean; msg: string }> => req("POST", "/api/warp/disconnect")
 };
 
 export interface Snippet {

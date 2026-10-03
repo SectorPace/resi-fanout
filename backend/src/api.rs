@@ -35,6 +35,11 @@ pub fn router(state: Arc<AppState>, web_root: &str) -> Router {
         .route("/xui/preview", post(xui_preview))
         .route("/xui/link", post(xui_link))
         .route("/xui/unlink", post(xui_unlink))
+        .route("/warp", get(warp_status))
+        .route("/warp/register", post(warp_register))
+        .route("/warp/import", post(warp_import))
+        .route("/warp/connect", post(warp_connect))
+        .route("/warp/disconnect", post(warp_disconnect))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth));
 
     let mut app = Router::new().nest("/api", api);
@@ -197,6 +202,71 @@ async fn proxies(
         })
         .collect();
     Json(json!({ "total": total, "items": page })).into_response()
+}
+
+// ------------------------------------------------------------------ Cloudflare WARP
+
+async fn warp_status(State(state): State<Arc<AppState>>) -> Response {
+    let st = crate::warp::status(&state).await;
+    let mut v = serde_json::to_value(st).unwrap_or(json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        match crate::warp::xray_outbound(&state).await {
+            Ok(ob) => {
+                obj.insert("xray_outbound".into(), ob);
+            }
+            Err(_) => {}
+        }
+    }
+    Json(v).into_response()
+}
+
+async fn warp_register(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let license = body
+        .as_ref()
+        .and_then(|b| b.0.get("license"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    match crate::warp::register(&state, license).await {
+        Ok(msg) => Json(json!({ "ok": true, "msg": msg })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+async fn warp_import(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let text = body
+        .as_ref()
+        .and_then(|b| b.0.get("config"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    match crate::warp::import_profile(&state, text).await {
+        Ok(p) => Json(json!({
+            "ok": true,
+            "endpoint": p.endpoint,
+            "addresses": p.addresses,
+            "dns": p.dns,
+            "msg": "profile saved"
+        }))
+        .into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+async fn warp_connect(State(state): State<Arc<AppState>>) -> Response {
+    match crate::warp::connect(&state).await {
+        Ok(()) => Json(json!({ "ok": true, "msg": "warp tunnel up" })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+async fn warp_disconnect(State(state): State<Arc<AppState>>) -> Response {
+    crate::warp::disconnect(&state).await;
+    Json(json!({ "ok": true, "msg": "warp tunnel down" })).into_response()
 }
 
 async fn ports(State(state): State<Arc<AppState>>) -> Response {

@@ -37,7 +37,7 @@
 curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash
 
 # 带参数的一键安装（注意 bash -s -- 后跟参数）
-curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash -s -- --with-vpngate --with-3xui
+curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash -s -- --with-vpngate --with-warp --with-3xui
 
 # 或者 clone 后本地运行
 git clone https://github.com/SectorPace/resi-fanout.git && cd resi-fanout
@@ -137,6 +137,46 @@ sudo bash install.sh --with-vpngate     # 装 openvpn + 启用
 - 连接失败重试 3 次后自动轮换下一个候选，服务器从池中消失也会自动摘除。
 
 **要求**：`openvpn` 已安装；服务需要 root 或 `CAP_NET_ADMIN`（`--with-vpngate` 安装的 systemd 单元已自动授予 `AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW`）；`/dev/net/tun` 可用（KVM/物理机没问题，部分 LXC/OpenVZ 容器默认禁用 tun）。UI 的 VPN Gate 页会显示每台服务器的日志策略（「不记录」= 该志愿者声明不留活动日志）。
+
+## Cloudflare WARP（WireGuard 出口）
+
+WARP 作为另一种隧道来源，接入方式和 VPN Gate 一样：起来后占一个本地 SOCKS 端口（默认 `22000`），自动进入 `/api/ports`、3x-ui 入站联动和负载均衡。
+
+```bash
+sudo bash install.sh --with-warp    # 装 wireguard-tools + wgcf
+```
+
+两种拿配置的方式：
+
+1. **官方 wgcf 注册**（UI「VPN Gate」页填 WARP+ 许可 key → 点「用 wgcf 注册」）。Cloudflare 的注册接口有 TLS 指纹校验，所以直接调官方工具最稳；WARP+ 许可会透传给 `wgcf register --license <key>`。
+2. **粘贴现成配置**：把 wgcf 生成的 `wgcf-profile.conf` 或手写配置粘进文本框点「导入这份配置」：
+
+```ini
+[Interface]
+PrivateKey = <你的私钥>
+Address = 172.16.0.2/32
+Address = 2606:4700:110:8b49:6e47:6be6:43c7:999c/128
+DNS = 162.159.193.10
+
+[Peer]
+PublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+Endpoint = engage.cloudflareclient.com:2408
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 60
+```
+
+实现要点：托管配置用 `Table = off` + 我们自己的 `warp-up.sh` 源策略路由（表号 = 本地端口），所以**主机默认路由不受影响**；DNS 走宿主解析；隧道出口同样做 ip-api 分类（WARP 出口一般是 Cloudflare 机房 IP，会标「机房」）。私钥只保存在本机 `/var/lib/resi-fanout/warp/warp.conf`，不进仓库。
+
+UI 还会**生成 Xray 原生 wireguard 出站**（就是上面那份配置转成 outbound JSON，复制进 3x-ui 的 Xray 配置即可用），两条路线可以任选或并用：
+
+```json
+{ "tag": "warp", "protocol": "wireguard",
+  "settings": { "secretKey": "<私钥>", "address": ["172.16.0.2/32", "2606:4700:...:999c/128"],
+    "mtu": 1280,
+    "peers": [{ "publicKey": "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+      "endpoint": "engage.cloudflareclient.com:2408",
+      "allowedIPs": ["0.0.0.0/0", "::/0"], "keepAlive": 60 }] } }
+```
 
 ## 配置说明（config.json）
 
