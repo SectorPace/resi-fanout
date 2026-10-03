@@ -41,15 +41,18 @@ async fn load_server_config(cfg: &TlsCfg) -> anyhow::Result<rustls::ServerConfig
         .await
         .map_err(|e| anyhow::anyhow!("read key {}: {e}", cfg.key_path))?;
 
+    // rustls-pemfile 2.x reads from a BufRead, not a byte slice
+    let mut cert_reader = std::io::BufReader::new(&cert_data[..]);
     let cert_chain: Vec<rustls_pki_types::CertificateDer<'static>> =
-        rustls_pemfile::certs(&cert_data)
+        rustls_pemfile::certs(&mut cert_reader)
             .collect::<Result<_, _>>()
             .map_err(|e| anyhow::anyhow!("parse cert {}: {e}", cfg.cert_path))?;
     if cert_chain.is_empty() {
         anyhow::bail!("no certificate found in {}", cfg.cert_path);
     }
 
-    let key = match rustls_pemfile::private_key(&key_data) {
+    let mut key_reader = std::io::BufReader::new(&key_data[..]);
+    let key = match rustls_pemfile::private_key(&mut key_reader) {
         Ok(Some(k)) => k,
         Ok(None) => anyhow::bail!("no private key found in {}", cfg.key_path),
         Err(e) => anyhow::bail!("parse key {}: {e}", cfg.key_path),
@@ -88,7 +91,7 @@ pub async fn serve(
         tokio::spawn(async move {
             match acceptor.accept(tcp).await {
                 Ok(stream) => {
-                    let svc = TowerToHyperService::new(app.into_make_service());
+                    let svc = TowerToHyperService::new(app.clone());
                     if let Err(e) = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), svc)
                         .await
