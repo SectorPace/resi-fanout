@@ -38,7 +38,8 @@
     "scripts_dir": "/opt/resi-fanout/scripts",
     "cache_days": 30,
     "max_pool": 800,
-    "extra_urls": []
+    "extra_urls": [],
+    "mirror_urls": []
   },
   "warp": {
     "enabled": false,

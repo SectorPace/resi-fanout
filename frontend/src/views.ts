@@ -428,8 +428,10 @@ export function renderVpngate(root: HTMLElement): void {
       return;
     }
     if (hint) {
+      const m = (info as unknown as { meta?: { source?: string; rows?: number; at?: number } }).meta;
+      const src = m?.source ? ` · 源 ${m.source.split("/")[2] ?? m.source}` : "";
       hint.textContent = info.enabled
-        ? ` 已启用 · 在线 ${info.pool_size} 台 · 累计缓存 ${info.pool_cached} 台 · 更新 ${fmtTs2(info.pool_ts)}`
+        ? ` 已启用 · 在线 ${info.pool_size} 台 · 累计缓存 ${info.pool_cached} 台${src} · 更新 ${fmtTs2(info.pool_ts)}`
         : " 未启用：在「配置」页开启 vpngate.enabled 并安装 openvpn";
     }
     const tb = document.getElementById("vg-tunnels");

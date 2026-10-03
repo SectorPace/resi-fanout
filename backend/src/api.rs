@@ -380,6 +380,7 @@ async fn vpngate(State(state): State<Arc<AppState>>) -> Response {
         "pool_ts": state.vpn_pool_ts.load(Ordering::Relaxed),
         "pool_size": live_count,
         "pool_cached": state.vpn_pool.read().await.len(),
+        "meta": *state.vpn_meta.read().await,
         "tunnels": tunnels,
         "top": top,
     }))

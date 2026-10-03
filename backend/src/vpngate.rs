@@ -162,70 +162,197 @@ fn cert_country(subject: &str) -> Option<String> {
     (code.len() == 2 && code.chars().all(|c| c.is_ascii_alphabetic())).then_some(code)
 }
 
+/// Metadata about the snapshot we last accepted — surfaced in the UI so you
+/// can see how fresh the node list is and which source answered.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct FetchMeta {
+    pub source: String,
+    pub rows: usize,
+    pub bytes: usize,
+    pub sha256: String,
+    pub at: i64,
+    pub errors: Vec<String>,
+}
+
+const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SNAPSHOT_ROWS: usize = 5000;
+const CSV_MARKER: &str = "OpenVPN_ConfigData_Base64";
+
+/// A captive portal or an error page must never make it into the pool, so a
+/// response only counts when it carries the VPN Gate CSV header.
+fn looks_like_vpngate_csv(text: &str) -> bool {
+    text.contains(CSV_MARKER)
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Ordered fetch chain: official HTTPS → official HTTP → mirrors → extra ovpn
+/// sources. First response that validates wins.
+async fn fetch_first_valid(
+    client: &reqwest::Client,
+    api_url: &str,
+    mirrors: &[String],
+    extras: &[String],
+) -> Result<(Vec<VpnServer>, String, usize, String, String), Vec<String>> {
+    let mut errors = Vec::new();
+
+    let mut candidates: Vec<(String, bool)> = Vec::new(); // (url, is_ovpn_source)
+    candidates.push((api_url.to_string(), false));
+    if let Some(http_url) = api_url.strip_prefix("https://") {
+        candidates.push((format!("http://{http_url}"), false));
+    }
+    for m in mirrors {
+        candidates.push((m.clone(), false));
+    }
+    for e in extras {
+        candidates.push((e.clone(), true));
+    }
+
+    for (url, ovpn_style) in candidates {
+        let fetch_url = url.clone();
+        let got: anyhow::Result<Vec<u8>> = async {
+            let resp = client.get(&fetch_url).send().await?;
+            if !resp.status().is_success() {
+                anyhow::bail!("http {}", resp.status());
+            }
+            let bytes = resp.bytes().await?;
+            if bytes.len() > MAX_SNAPSHOT_BYTES {
+                anyhow::bail!("too large: {} bytes", bytes.len());
+            }
+            Ok(bytes.to_vec())
+        }
+        .await;
+
+        match got {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes).to_string();
+                let servers = if looks_like_vpngate_csv(&text) {
+                    parse_csv(&text)
+                } else if ovpn_style {
+                    parse_ovpn_configs(&text)
+                } else {
+                    vec![]
+                };
+                if servers.is_empty() {
+                    errors.push(format!("{url}: response did not validate"));
+                    continue;
+                }
+                let servers: Vec<VpnServer> = servers.into_iter().take(MAX_SNAPSHOT_ROWS).collect();
+                let size = bytes.len();
+                let digest = sha256_hex(&bytes);
+                return Ok((servers, url, size, digest, text));
+            }
+            Err(e) => errors.push(format!("{url}: {e}")),
+        }
+    }
+    Err(errors)
+}
+
+fn snapshot_dir(state: &Arc<AppState>) -> std::path::PathBuf {
+    state.data_dir.join("vpngate")
+}
+
+async fn save_snapshot(state: &Arc<AppState>, text: &str, meta: &FetchMeta) {
+    let dir = snapshot_dir(state);
+    let _ = tokio::fs::create_dir_all(&dir).await;
+    let _ = tokio::fs::write(dir.join("snapshot.csv"), text).await;
+    let _ = tokio::fs::write(
+        dir.join("snapshot.json"),
+        serde_json::to_string(meta).unwrap_or_default(),
+    )
+    .await;
+}
+
 /// Fetch and parse the public list; merges into the persistent pool cache.
+/// On total failure the last known-good local snapshot is reused.
 pub async fn refresh_pool(state: &Arc<AppState>) {
     let cfg = state.config().await;
     let client = crate::sources::build_client();
-    let url = cfg.vpngate.api_url.clone();
-    let extras = cfg.vpngate.extra_urls.clone();
-    let fetch = async {
-        let resp = client.get(&url).send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("vpngate api http {}", resp.status());
-        }
-        // vpngate.net declares charsets reqwest can't decode; take raw
-        // bytes and decode leniently instead of trusting the header.
-        let bytes = resp.bytes().await?;
-        let text = String::from_utf8_lossy(&bytes).to_string();
-        let mut servers = parse_csv(&text);
 
-        for extra in &extras {
-            match client.get(extra).send().await {
-                Ok(r) if r.status().is_success() => match r.bytes().await {
-                    Ok(b) => {
-                        let t = String::from_utf8_lossy(&b).to_string();
-                        let n = parse_ovpn_configs(&t).len();
-                        info!(url = %extra, count = n, "vpngate: extra ovpn source");
-                        servers.extend(parse_ovpn_configs(&t));
+    let fetched = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        fetch_first_valid(&client, &cfg.vpngate.api_url, &cfg.vpngate.mirror_urls, &cfg.vpngate.extra_urls),
+    )
+    .await;
+
+    let (fresh, meta) = match fetched {
+        Ok(Ok((servers, source, bytes, digest, text))) => {
+            let rows = servers.len();
+            let meta = FetchMeta {
+                source,
+                rows,
+                bytes,
+                sha256: digest,
+                at: crate::models::now_ts(),
+                errors: vec![],
+            };
+            save_snapshot(state, &text, &meta).await;
+            (servers, meta)
+        }
+        Ok(Err(errors)) => {
+            warn!(?errors, "vpngate: all sources failed, falling back to local snapshot");
+            let dir = snapshot_dir(state);
+            let recovered = tokio::fs::read_to_string(dir.join("snapshot.csv")).await.ok();
+            match recovered {
+                Some(text) if looks_like_vpngate_csv(&text) => {
+                    let servers = parse_csv(&text);
+                    let meta = FetchMeta {
+                        source: "local snapshot".into(),
+                        rows: servers.len(),
+                        bytes: text.len(),
+                        sha256: sha256_hex(text.as_bytes()),
+                        at: crate::models::now_ts(),
+                        errors,
+                    };
+                    save_snapshot(state, &text, &meta).await;
+                    (servers, meta)
+                }
+                _ => {
+                    warn!("vpngate: no usable snapshot either, keeping the cached pool");
+                    let mut src = state.vpn_meta.write().await;
+                    if let Some(m) = src.as_mut() {
+                        m.errors = errors;
                     }
-                    Err(e) => warn!(url = %extra, error = %e, "vpngate: extra source body"),
-                },
-                Ok(r) => warn!(url = %extra, status = %r.status(), "vpngate: extra source"),
-                Err(e) => warn!(url = %extra, error = %e, "vpngate: extra source"),
-            }
-        }
-        Ok(servers)
-    };
-
-    match tokio::time::timeout(std::time::Duration::from_secs(60), fetch).await {
-        Ok(Ok(fresh)) => {
-            let now = crate::models::now_ts();
-            let mut pool = state.vpn_pool.write().await;
-            let live_before = fresh.len();
-            // merge: refresh last_seen for live relays, keep cached ones so
-            // nodes that went offline can be retried when they come back
-            for mut s in fresh {
-                s.last_seen = now;
-                match pool.iter_mut().find(|p| p.server_key() == s.server_key()) {
-                    Some(existing) => *existing = s,
-                    None => pool.push(s),
+                    return;
                 }
             }
-            // prune by age + cap
-            let cutoff = now - (cfg.vpngate.cache_days as i64) * 86400;
-            pool.retain(|s| s.last_seen >= cutoff);
-            if cfg.vpngate.max_pool > 0 && pool.len() > cfg.vpngate.max_pool {
-                pool.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then(b.score.cmp(&a.score)));
-                pool.truncate(cfg.vpngate.max_pool);
-            }
-            let cached = pool.len();
-            state.vpn_pool_ts.store(now, std::sync::atomic::Ordering::Relaxed);
-            state.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
-            info!(live = live_before, cached, "vpngate pool refreshed");
         }
-        Ok(Err(e)) => warn!(error = %e, "vpngate pool fetch failed"),
-        Err(_) => warn!("vpngate pool fetch timed out"),
+        Err(_) => {
+            warn!("vpngate: fetch timed out, keeping the cached pool");
+            return;
+        }
+    };
+
+    let now = meta.at;
+    let mut pool = state.vpn_pool.write().await;
+    let live_before = fresh.len();
+    // merge: refresh last_seen for live relays, keep cached ones so nodes
+    // that went offline can be retried when they come back
+    for mut s in fresh {
+        s.last_seen = now;
+        match pool.iter_mut().find(|p| p.server_key() == s.server_key()) {
+            Some(existing) => *existing = s,
+            None => pool.push(s),
+        }
     }
+    // prune by age + cap
+    let cutoff = now - (cfg.vpngate.cache_days as i64) * 86400;
+    pool.retain(|s| s.last_seen >= cutoff);
+    if cfg.vpngate.max_pool > 0 && pool.len() > cfg.vpngate.max_pool {
+        pool.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then(b.score.cmp(&a.score)));
+        pool.truncate(cfg.vpngate.max_pool);
+    }
+    let cached = pool.len();
+    drop(pool);
+    state.vpn_pool_ts.store(now, std::sync::atomic::Ordering::Relaxed);
+    *state.vpn_meta.write().await = Some(meta.clone());
+    state.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    info!(source = %meta.source, live = live_before, cached, sha = %&meta.sha256[..8.min(meta.sha256.len())], "vpngate pool refreshed");
 }
 
 /// Apply the country / speed filters and rank candidates best-first.

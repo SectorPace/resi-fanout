@@ -142,6 +142,9 @@ pub struct VpngateCfg {
     /// is cached so churned nodes can be retried later.
     pub cache_days: u64,
     pub max_pool: usize,
+    /// Snapshot mirrors tried when the official API is unreachable or blocked
+    /// (e.g. https://<user>.github.io/<repo>/vpngate.csv).
+    pub mirror_urls: Vec<String>,
     /// Extra sources of raw OpenVPN configs (VPN Gate mirrors and the like).
     /// Each URL may serve one .ovpn or many config blocks back to back.
     pub extra_urls: Vec<String>,
@@ -161,6 +164,7 @@ impl Default for VpngateCfg {
             scripts_dir: "scripts".into(),
             cache_days: 30,
             max_pool: 800,
+            mirror_urls: vec![],
             extra_urls: vec![],
         }
     }

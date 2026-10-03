@@ -22,6 +22,8 @@ pub struct AppState {
     /// VPN Gate: latest parsed server pool + active tunnel assignments.
     pub vpn_pool: RwLock<Vec<VpnServer>>,
     pub vpn_pool_ts: std::sync::atomic::AtomicI64,
+    /// which source served the last snapshot + freshness/validation info
+    pub vpn_meta: RwLock<Option<crate::vpngate::FetchMeta>>,
     pub vpn_tunnels: RwLock<Vec<VpnTunnel>>,
     pub busy: AtomicBool,
     pub dirty: AtomicBool,
@@ -51,6 +53,7 @@ impl AppState {
             last_check_all: RwLock::new(None),
             vpn_pool: RwLock::new(vec![]),
             vpn_pool_ts: std::sync::atomic::AtomicI64::new(0),
+            vpn_meta: RwLock::new(None),
             vpn_tunnels: RwLock::new(vec![]),
             busy: AtomicBool::new(false),
             dirty: AtomicBool::new(false),

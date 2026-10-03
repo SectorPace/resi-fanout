@@ -131,6 +131,7 @@ sudo bash install.sh --with-vpngate     # 装 openvpn + 启用
 
 - 定时抓取官方列表（速度 / Ping / 会话数 / 是否记日志），按 `score` 排序，按 `vpngate.countries` 国家白名单与 `min_speed_mbps` 过滤，自动选 `max_servers` 台；
 - **节点累积**：官方 API 单次只返回约 100 台在线节点且不支持分页，所以见过的节点全部缓存（`cache_days` 天内），下线后仍可择机重连——持续运行一天通常能积累到数百台可选节点，UI 里显示「在线 N 台 / 累计缓存 M 台」；
+- **多源回退**：官方 API（HTTPS → HTTP）→ `vpngate.mirror_urls` 快照镜像 → 额外 OVPN 源；每个响应都会做**快照校验**（必须含 `OpenVPN_ConfigData_Base64` 表头、大小/行数上限），错误页不会污染节点池；全部失败时回落到本地快照 `/var/lib/resi-fanout/vpngate/snapshot.csv`（带 sha256 与抓取源记录，UI 里能看到生效源和新鲜度）。多源之间还会**合并去重**（官方 100 + 镜像 99 实测合并出 195 台）。
 - **额外源**：`vpngate.extra_urls` 可填任意返回原始 OpenVPN 配置文本的 URL（VPN Gate 镜像站、社区配置合集等），单个 .ovpn 或多段配置拼接都支持，国家码从证书 `C=` 里提取；速度未知的节点不参与速度过滤；
 - 每条隧道 `route-nopull` + **源地址策略路由**（`ip rule from <tun-ip> lookup <table>`，table = 本地端口号），主机默认路由完全不受影响，断开时自动清理；
 - 隧道建立后用同一套 ip-api 逻辑做**出口住宅识别**，UI 里显示出口国家/ISP/是否住宅；`vpngate.only_residential: true` 时机房出口自动杀掉换下一台；
