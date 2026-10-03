@@ -754,7 +754,7 @@ pub fn clash_to_wireguard(node: &ClashNode, keepalive: u64, mtu: u64) -> Result<
 /// exposes a local socks port our fanout can dial through.
 pub fn clash_to_mihomo(node: &ClashNode, port: u16) -> String {
     use serde_json::json;
-    let proxy = json!({
+    let mut proxy = json!({
         "name": node.name,
         "type": node.kind,
         "server": node.server,
@@ -766,9 +766,15 @@ pub fn clash_to_mihomo(node: &ClashNode, port: u16) -> String {
         "mtu": node.mtu.unwrap_or(1280),
         "udp": node.udp,
         "sni": node.sni.clone().unwrap_or_else(|| "www.microsoft.com".into()),
-        "remote-dns-resolve": true,
-        "dns": node.dns.clone(),
     });
+    // remote-dns-resolve needs a resolver list; nodes without one must not
+    // get an empty `dns: []`, mihomo rejects that
+    if !node.dns.is_empty() {
+        if let Some(obj) = proxy.as_object_mut() {
+            obj.insert("remote-dns-resolve".into(), json!(true));
+            obj.insert("dns".into(), json!(node.dns.clone()));
+        }
+    }
     let doc = json!({
         "mixed-port": port,
         "allow-lan": false,

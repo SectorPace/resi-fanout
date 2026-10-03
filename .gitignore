@@ -1,5 +1,7 @@
 target/
 node_modules/
 *.log
+# local runtime dir: node pool state, WARP/MASQUE profiles (may contain private keys)
+data/
 state.json
 config.json
