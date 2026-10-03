@@ -265,7 +265,7 @@ export function renderVpngate(root: HTMLElement): void {
     }
     if (hint) {
       hint.textContent = info.enabled
-        ? ` 已启用 · 池 ${info.pool_size} 台 · 更新 ${fmtTs2(info.pool_ts)}`
+        ? ` 已启用 · 在线 ${info.pool_size} 台 · 累计缓存 ${info.pool_cached} 台 · 更新 ${fmtTs2(info.pool_ts)}`
         : " 未启用：在「配置」页开启 vpngate.enabled 并安装 openvpn";
     }
     const tb = document.getElementById("vg-tunnels");
@@ -302,7 +302,7 @@ export function renderVpngate(root: HTMLElement): void {
           { class: "tbl" },
           el("thead", {}, el("tr", {},
             el("th", {}, "主机"), el("th", {}, "国家"), el("th", {}, "速度"),
-            el("th", {}, "Ping"), el("th", {}, "会话数"), el("th", {}, "运行时长"), el("th", {}, "日志"), el("th", {}, "Score")
+            el("th", {}, "Ping"), el("th", {}, "会话数"), el("th", {}, "运行时长"), el("th", {}, "日志"), el("th", {}, "Score"), el("th", {}, "上次在线")
           )),
           el("tbody", {},
             ...info.top.slice(0, 50).map((s) => el("tr", {},
@@ -313,7 +313,8 @@ export function renderVpngate(root: HTMLElement): void {
               el("td", {}, String(s.sessions)),
               el("td", {}, fmtUptime2(s.uptime_secs)),
               el("td", {}, s.logs_kept == null ? "—" : s.logs_kept ? badge("记录", "warn") : badge("不记录", "ok")),
-              el("td", {}, String(s.score))
+              el("td", {}, String(s.score)),
+              el("td", { class: "dim" }, s.last_seen ? fmtTs2(s.last_seen) : "缓存")
             ))
           )
         )
@@ -522,8 +523,47 @@ export function renderXui(root: HTMLElement): void {
       el(
         "fieldset",
         {},
+        el("legend", {}, "接管 3x-ui 面板入站（fanout 式）"),
+        el("small", { class: "dim" },
+          "为每个出口克隆一条面板入站：客户端连不同入站 → 从不同国家/住宅 IP 出去。写库前自动备份。"),
+        el("div", { id: "xui-panel-status", class: "dim" }, "未加载面板"),
+        el(
+          "div",
+          { class: "filterbar" },
+          el("select", { id: "xui-template" }, el("option", { value: "0" }, "加载面板入站中…")),
+          el("input", { id: "xui-host", placeholder: "链接域名，如 panel.example.com", style: "flex:1" }),
+          el(
+            "button",
+            { onclick: () => void loadPanelInbounds() },
+            "加载面板入站"
+          ),
+          el("button", { onclick: () => void doLink(true) }, "预览"),
+          el("button", { class: "primary", onclick: () => void doLink(false) }, "执行联动"),
+          el("button", {
+            onclick: async () => {
+              if (!confirm("解绑会删除面板里所有 resi-in-* 入站及其路由规则，确定？")) return;
+              try {
+                const r = await api.xuiUnlink();
+                toast(`已解绑 ${r.removed?.length ?? 0} 条入站（${r.restart || ""}）`);
+                await loadPanelInbounds();
+              } catch (e) { toast(String(e), false); }
+            }
+          }, "解绑")
+        ),
+        el("div", { id: "xui-links" })
+      ),
+      el(
+        "fieldset",
+        {},
         el("legend", {}, "生成出站配置"),
         el("small", { class: "dim" }, "选择要接入 3x-ui 的本地端口（默认全部已分配端口），生成 Xray outbounds。"),
+        el(
+          "select",
+          { id: "xui-mode" },
+          el("option", { value: "direct" }, "直连：每端口一条规则（配合面板入站联动）"),
+          el("option", { value: "balancer" }, "负载均衡：一个入站在所有出口间轮换（leastPing）")
+        ),
+        el("input", { id: "xui-inbound", placeholder: "负载均衡模式：填入站 tag（可选）", style: "width:100%;margin:8px 0" }),
         el("div", { id: "xui-ports", class: "portlist" }),
         el(
           "div",
@@ -537,31 +577,116 @@ export function renderXui(root: HTMLElement): void {
           el("button", { class: "primary", onclick: () => void gen(false) }, "生成"),
           el("button", { onclick: () => void gen(true) }, "仅住宅端口")
         )
-      ),
-      el(
-        "fieldset",
-        {},
-        el("legend", {}, "使用方法"),
-        el(
-          "ol",
-          { class: "steps" },
-          el("li", {}, "3x-ui 面板 → 设置 → Xray 配置，把下方 outbounds 合并进 outbounds 数组，保存后 Xray 自动重启。"),
-          el("li", {}, "需要按入站分流时，把 rules_example 的 inboundTag 改成你的入站 tag，加入 routing.rules。"),
-          el("li", {}, "或者直接在服务器上运行: ", el("code", { class: "mono" }, "bash /opt/resi-fanout/scripts/3xui-push.sh --api http://127.0.0.1:7654 --key <API_KEY>"), "（自动写入面板配置并重启 x-ui）")
-        )
       )
     ),
     el("div", { id: "xui-output" })
   );
+
+  async function loadPanelInbounds(): Promise<void> {
+    const status = document.getElementById("xui-panel-status");
+    const sel = document.getElementById("xui-template") as HTMLSelectElement;
+    if (status) status.textContent = "正在读取面板数据库…";
+    try {
+      const info = await api.xuiInbounds();
+      const list = info.inbounds || [];
+      sel.replaceChildren(
+        ...(list.length
+          ? list.map((i) =>
+              el(
+                "option",
+                { value: String(i.id) },
+                `#${i.id} ${i.tag || i.remark || "-"} · ${i.protocol || "?"}:${i.port || "?"} · ${i.clients ?? 0}客户端${i.enable === false ? "（已禁用）" : ""}`
+              )
+            )
+          : [el("option", { value: "0" }, "面板里还没有入站")])
+      );
+      if (status) {
+        status.textContent = `已加载 ${list.length} 条入站${info.clients_table ? `（客户端在 ${info.clients_table} 表，v3 布局）` : "（客户端内嵌于 settings，v2 布局）"}`;
+      }
+    } catch (e) {
+      if (status) status.textContent = `读取失败：${e}（检查 xui.db_path / xui.script_path 配置）`;
+    }
+  }
+
+  function linkBody(): { template_id: number; ports?: number[]; residential_only: boolean } {
+    const sel = document.getElementById("xui-template") as HTMLSelectElement;
+    const mode = (document.getElementById("xui-mode") as HTMLSelectElement).value;
+    const body: { template_id: number; ports?: number[]; residential_only: boolean } = {
+      template_id: Number(sel.value) || 0,
+      residential_only: mode === "balancer" ? false : false
+    };
+    if (mode !== "balancer") {
+      const checked = checkedPorts();
+      if (checked.length) body.ports = checked;
+    }
+    const host = (document.getElementById("xui-host") as HTMLInputElement).value.trim();
+    if (host) (body as Record<string, unknown>).host = host;
+    return body;
+  }
+
+  async function doLink(preview: boolean): Promise<void> {
+    const out = document.getElementById("xui-links");
+    if (!out) return;
+    const body = linkBody();
+    if (!body.template_id) {
+      toast("先点「加载面板入站」并选择一个模板入站", false);
+      return;
+    }
+    try {
+      const r = preview ? await api.xuiPreview(body) : await api.xuiLink(body);
+      const rows = r.plan || r.created || [];
+      out.replaceChildren(
+        el("h3", {}, preview ? "联动预览（未写入）" : "已写入面板"),
+        el(
+          "table",
+          { class: "tbl" },
+          el("thead", {}, el("tr", {}, el("th", {}, "本地端口"), el("th", {}, "面板入站端口"), el("th", {}, "客户端链接"))),
+          el(
+            "tbody",
+            {},
+            ...rows.map((row) =>
+              el(
+                "tr",
+                {},
+                el("td", { class: "mono" }, String((row as Record<string, unknown>).fanout_port ?? (row as Record<string, unknown>).inbound_tag ?? "")),
+                el("td", { class: "mono" }, String(row.inbound_port)),
+                el("td", { class: "mono small" }, row.link || "")
+              )
+            )
+          )
+        ),
+        r.backup ? el("small", { class: "dim" }, `数据库备份：${r.backup}`) : el("span"),
+        r.restart ? el("small", { class: "dim" }, ` ${r.restart}`) : el("span"),
+        preview
+          ? el("button", { onclick: () => void doLink(false) }, "确认写入面板")
+          : el("button", {
+              onclick: () => {
+                void navigator.clipboard.writeText(rows.map((x) => x.link || "").join("\n"));
+                toast("已复制链接");
+              }
+            }, "复制全部链接")
+      );
+      if (!preview) await loadPanelInbounds();
+    } catch (e) {
+      out.replaceChildren(el("div", { class: "error" }, String(e)));
+    }
+  }
+
+  void loadPanelInbounds();
 
   async function gen(residentialOnly: boolean): Promise<void> {
     const out = document.getElementById("xui-output");
     if (!out) return;
     const params = new URLSearchParams();
     const prefix = (document.getElementById("xui-prefix") as HTMLInputElement).value.trim() || "resi";
+    const mode = (document.getElementById("xui-mode") as HTMLSelectElement).value;
+    const inbound = (document.getElementById("xui-inbound") as HTMLInputElement).value.trim();
     params.set("prefix", prefix);
-    if (residentialOnly) {
-      params.set("residential", "1");
+    params.set("mode", mode);
+    if (mode === "balancer") {
+      params.set("residential", residentialOnly ? "1" : "0");
+      if (residentialOnly) params.set("residential", "1");
+      if (inbound) params.set("inbound", inbound);
     } else {
       const checked = checkedPorts();
       if (checked.length) params.set("ports", checked.join(","));
@@ -587,6 +712,7 @@ export function renderXui(root: HTMLElement): void {
         el("div", { class: "dim" }, sn.usage),
         block("outbounds（合并进 Xray 配置的 outbounds 数组）", sn.outbounds),
         block("rules_example（分流规则示例）", sn.rules_example),
+        block("observatory + balancers（负载均衡模式需要）", sn.balancer_extra),
         block("full_template（3x-ui 数据库无模板时可用）", sn.full_template)
       );
     } catch (e) {

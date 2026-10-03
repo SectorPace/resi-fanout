@@ -19,6 +19,12 @@
 #   --rule-inbound T1,T2 add routing rule: these inbound tags -> --outbound tag
 #   --outbound TAG       target outbound for --rule-inbound (default first port tag)
 #   --db PATH            override panel db path
+#   --link-inbounds      instead of merging outbounds, clone a panel inbound
+#                        per fanout port (fanout style; calls xui_db.py link)
+#   --template-id N      inbound id used as the template for --link-inbounds
+#   --host DOMAIN        host used in generated client links
+#   --residential        only link residential exits
+#   --unlink             remove previously linked inbounds (--link-inbounds off)
 #   --no-restart         edit db but do not restart x-ui
 
 set -euo pipefail
@@ -32,6 +38,11 @@ RULE_INBOUND=""
 RULE_OUTBOUND=""
 DB=""
 RESTART="1"
+LINK_INBOUNDS="0"
+TEMPLATE_ID="1"
+HOST="${XUI_HOST:-127.0.0.1}"
+UNLINK="0"
+XUI_DB_PY="${XUI_DB_PY:-/opt/resi-fanout/scripts/xui_db.py}"
 
 log()  { printf '\033[1;34m[3xui-push]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
@@ -46,6 +57,10 @@ while [ $# -gt 0 ]; do
     --rule-inbound) RULE_INBOUND="${2:?}"; shift 2 ;;
     --outbound)     RULE_OUTBOUND="${2:?}"; shift 2 ;;
     --db)           DB="${2:?}"; shift 2 ;;
+    --link-inbounds) LINK_INBOUNDS="1"; shift ;;
+    --template-id)  TEMPLATE_ID="${2:?}"; shift 2 ;;
+    --host)         HOST="${2:?}"; shift 2 ;;
+    --unlink)       UNLINK="1"; LINK_INBOUNDS="0"; shift ;;
     --no-restart)   RESTART="0"; shift ;;
     *) die "unknown option: $1" ;;
   esac
@@ -81,7 +96,47 @@ BACKUP="${DB}.bak.$(date +%Y%m%d%H%M%S)"
 cp -a "${DB}" "${BACKUP}"
 log "backup written: ${BACKUP}"
 
-# ---------------------------------------------------------------- merge into db
+# ---------------------------------------------------------------- inbound linking
+if [ "${LINK_INBOUNDS}" = "1" ] || [ "${UNLINK}" = "1" ]; then
+  [ -f "${XUI_DB_PY}" ] || die "xui_db.py not found at ${XUI_DB_PY} (override with XUI_DB_PY=...)"
+  if [ "${UNLINK}" = "1" ]; then
+    log "removing previously linked inbounds from the panel"
+    python3 "${XUI_DB_PY}" unlink --db "${DB}" \
+      --inbound-prefix "resi-in-" --outbound-prefix "${PREFIX}" \
+      | python3 -m json.tool
+  else
+    ENTRIES="$(curl -fsS "${AUTH[@]}" "${API}/api/ports" | RESIDENTIAL="${RESIDENTIAL}" python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)
+only_resi = os.environ.get("RESIDENTIAL") == "1"
+out = [
+    {"port": e["port"], "country": e.get("country_code") or "xx",
+     "residential": bool(e.get("residential")), "kind": e.get("kind", "proxy")}
+    for e in d.get("items", [])
+    if not only_resi or e.get("residential")
+]
+print(json.dumps(out))')"
+    CNT="$(printf '%s' "${ENTRIES}" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
+    [ "${CNT}" != "0" ] || die "no fanout ports to link (is resi-fanout running and ports assigned?)"
+    log "linking ${CNT} fanout ports to panel inbounds (template #${TEMPLATE_ID}, host ${HOST})"
+    python3 "${XUI_DB_PY}" link --db "${DB}" \
+      --template-id "${TEMPLATE_ID}" \
+      --entries "${ENTRIES}" \
+      --host "${HOST}" \
+      --inbound-prefix "resi-in-" \
+      --outbound-prefix "${PREFIX}" \
+      --inbound-port-base "${XUI_INBOUND_PORT_BASE:-31000}" \
+      | python3 -m json.tool
+  fi
+  if [ "${RESTART}" = "1" ]; then
+    log "restarting x-ui"
+    command -v x-ui >/dev/null 2>&1 && x-ui restart >/dev/null 2>&1 || systemctl restart x-ui || true
+  fi
+  log "done"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- merge outbounds
 RULE_INBOUND="${RULE_INBOUND}" RULE_OUTBOUND="${RULE_OUTBOUND}" python3 - "${DB}" "${TMP}" <<'PYEOF'
 import json, os, sqlite3, sys
 

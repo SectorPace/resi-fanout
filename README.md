@@ -69,25 +69,39 @@ sudo bash install.sh
 
 ## 接入 3x-ui
 
-### 方式 A：面板粘贴（安全直观）
+### 方式 A：接管面板入站（fanout 式，推荐）
 
-1. 打开 UI →「接入 3x-ui」→ 选择端口（可只选住宅）→ 生成；
-2. 把 **outbounds** 数组复制进 3x-ui 面板 → 设置 → Xray 配置的 `outbounds`；
-3. 需要分流时，把 `rules_example` 里的 `inboundTag` 改成你的入站 tag 后加进 `routing.rules`；
-4. 保存，面板会自动重启 Xray。
+为**每个出口克隆一条面板入站**：客户端连不同入站 → 从不同国家/住宅 IP 出去（和 byJoey/fanout 一样）。写库前自动备份 `x-ui.db`，完成后可选自动重启面板。
 
-生成的出站长这样（每个端口一条）：
+UI 里：「接入 3x-ui」页 → 加载面板入站 → 选一个模板入站（沿用它的协议/流控/UUID）→ 预览 → 执行联动。也可用命令行：
+
+```bash
+bash /opt/resi-fanout/scripts/3xui-push.sh --api http://127.0.0.1:7654 --key <KEY> \
+    --link-inbounds --template-id 1 --host panel.example.com
+
+bash /opt/resi-fanout/scripts/3xui-push.sh --key <KEY> --unlink     # 解绑清理
+```
+
+联动会做三件事：克隆入站（新端口从 `xui.inbound_port_base` 起分配，tag `resi-in-<端口>`）→ 写入 `resi-<端口>` socks 出站 → 加 `入站 → 出站` 路由规则。**兼容 3x-ui v2/v3 两种数据库布局**（v2 客户端内嵌在 settings JSON，v3 是独立 clients 表并自动复制客户端），客户端链接（vless/trojan/ss/socks）一并生成。
+
+### 方式 B：手动粘贴出站配置
+
+UI「接入 3x-ui」页可生成 Xray `outbounds` / 路由规则，粘进面板的 Xray 配置即可。生成的出站长这样（每个端口一条）：
 
 ```json
 { "tag": "resi-20000", "protocol": "socks",
   "settings": { "servers": [ { "address": "127.0.0.1", "port": 20000 } ] } }
 ```
 
-### 方式 B：脚本一键写入
+### 方式 C：一个入站在所有出口间轮换（负载均衡）
+
+选「负载均衡」模式会额外生成 Xray `observatory`（探测 `resi-` 前缀出站）+ `routing.balancers`（`leastPing` 策略），配合一条 `inboundTag → balancerTag: resi-bal` 规则，让单个入站自动在全部住宅出口间按延迟轮换。
+
+### 方式 D：脚本一键合并出站（不建入站）
 
 ```bash
 bash /opt/resi-fanout/scripts/3xui-push.sh \
-    --api http://127.0.0.1:7654 --key <你的API_KEY>
+    --api http://127.0.0.1:7654 --key <API_KEY>
 
 # 只推住宅端口，并把某入站分流到指定出站：
 bash scripts/3xui-push.sh --key <KEY> --residential \
@@ -116,6 +130,8 @@ sudo bash install.sh --with-vpngate     # 装 openvpn + 启用
 工作方式：
 
 - 定时抓取官方列表（速度 / Ping / 会话数 / 是否记日志），按 `score` 排序，按 `vpngate.countries` 国家白名单与 `min_speed_mbps` 过滤，自动选 `max_servers` 台；
+- **节点累积**：官方 API 单次只返回约 100 台在线节点且不支持分页，所以见过的节点全部缓存（`cache_days` 天内），下线后仍可择机重连——持续运行一天通常能积累到数百台可选节点，UI 里显示「在线 N 台 / 累计缓存 M 台」；
+- **额外源**：`vpngate.extra_urls` 可填任意返回原始 OpenVPN 配置文本的 URL（VPN Gate 镜像站、社区配置合集等），单个 .ovpn 或多段配置拼接都支持，国家码从证书 `C=` 里提取；速度未知的节点不参与速度过滤；
 - 每条隧道 `route-nopull` + **源地址策略路由**（`ip rule from <tun-ip> lookup <table>`，table = 本地端口号），主机默认路由完全不受影响，断开时自动清理；
 - 隧道建立后用同一套 ip-api 逻辑做**出口住宅识别**，UI 里显示出口国家/ISP/是否住宅；`vpngate.only_residential: true` 时机房出口自动杀掉换下一台；
 - 连接失败重试 3 次后自动轮换下一个候选，服务器从池中消失也会自动摘除。
@@ -136,6 +152,10 @@ sudo bash install.sh --with-vpngate     # 装 openvpn + 启用
 | `scheduler.refresh_minutes` | `30` | 抓取周期（0=关闭调度） |
 | `scheduler.recheck_minutes` | `20` | 全池复检周期 |
 | `sources[]` | 9 个免费源 | `kind`: `text` / `monosans` / `geonode` |
+| `vpngate.enabled` / `max_servers` | `false` / `3` | VPN Gate 隧道开关与数量 |
+| `vpngate.cache_days` / `max_pool` / `extra_urls` | `30` / `800` / `[]` | 节点累积天数、池上限、额外 OVPN 源 |
+| `xui.db_path` / `script_path` | `/etc/x-ui/x-ui.db` | 面板数据库与联动脚本路径 |
+| `xui.inbound_port_base` / `host` | `31000` / `127.0.0.1` | 联动入站起始端口、客户端链接域名 |
 
 > **关于"住宅代理"**：免费列表里绝大多数是机房 IP，本项目靠 `ip-api.com` 的 `hosting` 标志把住宅/家宽节点**识别并筛选**出来（UI 中标「住宅」，可 `only_residential: true` 只扇出住宅）。想要稳定的高质量住宅线路，建议把付费服务商的提取 URL 加进 `sources`（输出 `ip:port` 即可），检测和住宅判定逻辑完全通用。
 

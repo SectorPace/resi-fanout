@@ -12,6 +12,7 @@ mod snippet;
 mod sources;
 mod state;
 mod vpngate;
+mod xui;
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;

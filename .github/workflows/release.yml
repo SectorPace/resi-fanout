@@ -52,6 +52,7 @@ jobs:
           cp "backend/target/${{ matrix.target }}/release/resi-fanout" "$DIR/bin/"
           cp -r frontend/dist/* "$DIR/web/"
           cp scripts/*.sh "$DIR/scripts/"
+          cp scripts/xui_db.py "$DIR/scripts/"
           cp backend/config.example.json "$DIR/"
           cp install.sh uninstall.sh README.md LICENSE "$DIR/"
           tar czf "$DIR.tar.gz" "$DIR"

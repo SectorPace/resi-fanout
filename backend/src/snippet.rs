@@ -8,7 +8,10 @@ use serde_json::{json, Value};
 
 use crate::models::PortEntry;
 
-pub fn build(entries: &[PortEntry], prefix: &str) -> Value {
+/// `mode`: "direct" = one inbound per port (fanout style);
+///         "balancer" = a single inbound balanced over every fanout port
+/// via an Xray observatory + balancer.
+pub fn build_with(entries: &[PortEntry], prefix: &str, mode: &str, inbound: &str) -> Value {
     let tag = |p: u16| format!("{prefix}-{p}");
 
     let outbounds: Vec<Value> = entries
@@ -39,30 +42,69 @@ pub fn build(entries: &[PortEntry], prefix: &str) -> Value {
     if let Some(arr) = full["outbounds"].as_array_mut() {
         arr.extend(outbounds.iter().cloned());
     }
+
+    let balancer = mode == "balancer";
+    let in_tag = if inbound.is_empty() {
+        "<你的入站tag>".to_string()
+    } else {
+        inbound.to_string()
+    };
     if let Some(rules) = full["routing"]["rules"].as_array_mut() {
-        // our rules go right after the panel api rule so they win over defaults
-        let api_rule = rules.iter().cloned().collect::<Vec<_>>();
+        // panel api rule first, then ours
+        let api_rule = rules.first().cloned();
         rules.clear();
-        for r in api_rule {
+        if let Some(r) = api_rule {
             rules.push(r);
-            break; // keep only the first (api) rule before ours
         }
-        for e in entries {
+        if balancer {
             rules.push(json!({
                 "type": "field",
-                "inboundTag": [format!("<你的入站tag-路由到{}>", tag(e.port))],
-                "outboundTag": tag(e.port)
+                "inboundTag": [in_tag],
+                "balancerTag": "resi-bal"
             }));
+        } else {
+            for e in entries {
+                rules.push(json!({
+                    "type": "field",
+                    "inboundTag": [format!("{}-in-{}", prefix, e.port)],
+                    "outboundTag": tag(e.port)
+                }));
+            }
         }
+    }
+
+    let mut extra = json!({});
+    if balancer {
+        full["observatory"] = json!({
+            "subjectSelector": [format!("{prefix}-")],
+            "probeURL": "http://www.gstatic.com/generate_204",
+            "probeInterval": "5m",
+            "enableConcurrency": true
+        });
+        full["routing"]["balancers"] = json!([{
+            "tag": "resi-bal",
+            "selector": [format!("{prefix}-")],
+            "strategy": { "type": "leastPing" }
+        }]);
+        extra = json!({
+            "observatory": full["observatory"],
+            "balancers": full["routing"]["balancers"]
+        });
     }
 
     json!({
         "prefix": prefix,
+        "mode": mode,
         "ports": entries.iter().map(|e| e.port).collect::<Vec<_>>(),
         "outbounds": outbounds,
         "rules_example": rules_example,
+        "balancer_extra": extra,
         "full_template": full,
-        "usage": "把 outbounds 合并进 3x-ui 面板 设置→Xray配置 的 outbounds 数组；需要分流时把 rules_example 里的 inboundTag 换成你的入站 tag 后加入 routing.rules。保存后重启 Xray。"
+        "usage": if balancer {
+            "负载均衡模式：把 outbounds 合并进 Xray 配置，再把 observatory / routing.balancers 合并进去（full_template 已含全部），规则里的 inboundTag 改成你的入站 tag，即可让一个入站在所有住宅出口间轮换（leastPing）。"
+        } else {
+            "把 outbounds 合并进 3x-ui 面板 设置→Xray配置 的 outbounds 数组；需要分流时把 rules_example 里的 inboundTag 换成你的入站 tag 后加入 routing.rules。保存后重启 Xray。"
+        }
     })
 }
 

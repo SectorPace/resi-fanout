@@ -138,6 +138,13 @@ pub struct VpngateCfg {
     pub api_url: String,
     /// Directory holding vpn-up.sh / vpn-down.sh.
     pub scripts_dir: String,
+    /// The official API only reports ~100 live relays; everything ever seen
+    /// is cached so churned nodes can be retried later.
+    pub cache_days: u64,
+    pub max_pool: usize,
+    /// Extra sources of raw OpenVPN configs (VPN Gate mirrors and the like).
+    /// Each URL may serve one .ovpn or many config blocks back to back.
+    pub extra_urls: Vec<String>,
 }
 
 impl Default for VpngateCfg {
@@ -152,6 +159,9 @@ impl Default for VpngateCfg {
             only_residential: false,
             api_url: "https://www.vpngate.net/api/iphone/".into(),
             scripts_dir: "scripts".into(),
+            cache_days: 30,
+            max_pool: 800,
+            extra_urls: vec![],
         }
     }
 }
@@ -180,6 +190,38 @@ impl Default for SourceCfg {
     }
 }
 
+/// 3x-ui panel integration (fanout-style inbound takeover).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct XuiCfg {
+    /// panel database
+    pub db_path: String,
+    /// path to xui_db.py (installed next to the binary's scripts/)
+    pub script_path: String,
+    /// first port used for the per-exit inbounds created in the panel
+    pub inbound_port_base: u16,
+    pub inbound_prefix: String,
+    pub outbound_prefix: String,
+    /// host used when building client links
+    pub host: String,
+    /// restart x-ui after writing the database
+    pub auto_restart: bool,
+}
+
+impl Default for XuiCfg {
+    fn default() -> Self {
+        Self {
+            db_path: "/etc/x-ui/x-ui.db".into(),
+            script_path: "/opt/resi-fanout/scripts/xui_db.py".into(),
+            inbound_port_base: 31000,
+            inbound_prefix: "resi-in-".into(),
+            outbound_prefix: "resi".into(),
+            host: "127.0.0.1".into(),
+            auto_restart: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -189,6 +231,7 @@ pub struct Config {
     pub scheduler: SchedulerCfg,
     pub filter: FilterCfg,
     pub vpngate: VpngateCfg,
+    pub xui: XuiCfg,
     pub sources: Vec<SourceCfg>,
 }
 
@@ -201,6 +244,7 @@ impl Default for Config {
             scheduler: SchedulerCfg::default(),
             filter: FilterCfg::default(),
             vpngate: VpngateCfg::default(),
+            xui: XuiCfg::default(),
             sources: default_sources(),
         }
     }

@@ -62,6 +62,7 @@ export interface VpnServer {
   uptime_secs: number;
   logs_kept?: boolean | null;
   operator?: string | null;
+  last_seen?: number;
 }
 
 export interface VpnTunnel {
@@ -85,8 +86,31 @@ export interface VpngateInfo {
   enabled: boolean;
   pool_ts?: number | null;
   pool_size: number;
+  pool_cached: number;
   tunnels: VpnTunnel[];
   top: VpnServer[];
+}
+
+export interface XuiInbound {
+  id: number;
+  tag?: string;
+  remark?: string;
+  port?: number;
+  protocol?: string;
+  enable?: boolean;
+  clients?: number;
+}
+
+export interface XuiInfo {
+  ok: boolean;
+  inbounds?: XuiInbound[];
+  clients_table?: string | null;
+  plan?: { fanout_port: number; inbound_port: number; inbound_tag: string; outbound_tag: string; remark: string; link: string }[];
+  created?: { inbound_id: number; inbound_port: number; inbound_tag: string; link: string }[];
+  removed?: { id: number; tag: string; port: number }[];
+  backup?: string;
+  restart?: string;
+  error?: string;
 }
 
 export interface Config {
@@ -155,14 +179,22 @@ export const api = {
   saveConfig: (c: Config): Promise<{ ok: boolean }> => req("PUT", "/api/config", c),
   snippet: (query: string): Promise<Snippet> => req("GET", `/api/3xui/snippet?${query}`),
   vpngate: (): Promise<VpngateInfo> => req("GET", "/api/vpngate"),
-  vpngateRebuild: (): Promise<{ ok: boolean }> => req("POST", "/api/vpngate/rebuild")
+  vpngateRebuild: (): Promise<{ ok: boolean }> => req("POST", "/api/vpngate/rebuild"),
+  xuiInbounds: (): Promise<XuiInfo> => req("GET", "/api/xui/inbounds"),
+  xuiPreview: (body: { template_id: number; ports?: number[]; residential_only?: boolean }): Promise<XuiInfo> =>
+    req("POST", "/api/xui/preview", body),
+  xuiLink: (body: { template_id: number; ports?: number[]; residential_only?: boolean; host?: string }): Promise<XuiInfo> =>
+    req("POST", "/api/xui/link", body),
+  xuiUnlink: (): Promise<XuiInfo> => req("POST", "/api/xui/unlink")
 };
 
 export interface Snippet {
   prefix: string;
+  mode: string;
   ports: number[];
   outbounds: unknown[];
   rules_example: unknown[];
+  balancer_extra: unknown;
   full_template: unknown;
   usage: string;
 }

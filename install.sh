@@ -182,6 +182,7 @@ log "installing to ${PREFIX}"
 install -d "${PREFIX}/bin" "${PREFIX}/web" "${PREFIX}/scripts" "${CONF_DIR}" "${DATA_DIR}"
 install -m 755 "${BINSRC}" "${PREFIX}/bin/${APP}"
 install -m 755 "${SRC_DIR}/scripts/3xui-push.sh" "${SRC_DIR}/scripts/vpn-up.sh" "${SRC_DIR}/scripts/vpn-down.sh" "${PREFIX}/scripts/" 2>/dev/null || true
+install -m 644 "${SRC_DIR}/scripts/xui_db.py" "${PREFIX}/scripts/xui_db.py" 2>/dev/null || true
 if [ -n "${DIST}" ] && [ -f "${DIST}/index.html" ]; then
   cp -r "${DIST}/." "${PREFIX}/web/"
 fi

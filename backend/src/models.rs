@@ -117,6 +117,9 @@ pub struct VpnServer {
     pub operator: Option<String>,
     #[serde(default)]
     pub config_b64: String,
+    /// unix ts of the last time this relay appeared in a fetched list
+    #[serde(default)]
+    pub last_seen: i64,
 }
 
 impl VpnServer {

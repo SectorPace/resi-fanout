@@ -35,7 +35,19 @@
     "openvpn_bin": "openvpn",
     "only_residential": false,
     "api_url": "https://www.vpngate.net/api/iphone/",
-    "scripts_dir": "/opt/resi-fanout/scripts"
+    "scripts_dir": "/opt/resi-fanout/scripts",
+    "cache_days": 30,
+    "max_pool": 800,
+    "extra_urls": []
+  },
+  "xui": {
+    "db_path": "/etc/x-ui/x-ui.db",
+    "script_path": "/opt/resi-fanout/scripts/xui_db.py",
+    "inbound_port_base": 31000,
+    "inbound_prefix": "resi-in-",
+    "outbound_prefix": "resi",
+    "host": "127.0.0.1",
+    "auto_restart": true
   },
   "sources": [
     {

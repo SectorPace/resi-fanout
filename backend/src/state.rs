@@ -34,6 +34,8 @@ struct StateFile {
     proxies: Vec<ProxyInfo>,
     #[serde(default)]
     vpn_tunnels: Vec<VpnTunnel>,
+    #[serde(default)]
+    vpn_pool: Vec<VpnServer>,
 }
 
 impl AppState {
@@ -95,6 +97,9 @@ impl AppState {
                     })
                     .collect();
                 *self.vpn_tunnels.write().await = tunnels;
+                // cached VPN Gate relays survive restarts so nodes that were
+                // offline can be retried when they come back
+                *self.vpn_pool.write().await = sf.vpn_pool;
                 tracing::info!(count, "state loaded");
             }
             Err(e) => warn!(error = %e, "failed to parse state file"),
@@ -105,12 +110,15 @@ impl AppState {
         tokio::fs::create_dir_all(&self.data_dir).await?;
         let map = self.proxies.read().await;
         let tunnels = self.vpn_tunnels.read().await;
+        let pool = self.vpn_pool.read().await;
         let sf = StateFile {
             proxies: map.values().cloned().collect(),
             vpn_tunnels: tunnels.clone(),
+            vpn_pool: pool.clone(),
         };
         drop(map);
         drop(tunnels);
+        drop(pool);
         let tmp = self.data_dir.join("state.json.tmp");
         let data = serde_json::to_string(&sf)?;
         tokio::fs::write(&tmp, data).await?;

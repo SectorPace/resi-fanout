@@ -31,6 +31,10 @@ pub fn router(state: Arc<AppState>, web_root: &str) -> Router {
         .route("/3xui/snippet", get(xui_snippet))
         .route("/vpngate", get(vpngate))
         .route("/vpngate/rebuild", post(vpngate_rebuild))
+        .route("/xui/inbounds", get(xui_inbounds))
+        .route("/xui/preview", post(xui_preview))
+        .route("/xui/link", post(xui_link))
+        .route("/xui/unlink", post(xui_unlink))
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth));
 
     let mut app = Router::new().nest("/api", api);
@@ -203,6 +207,10 @@ async fn vpngate(State(state): State<Arc<AppState>>) -> Response {
     let cfg = state.config().await;
     let pool = state.vpn_pool.read().await;
     let ranked = crate::vpngate::rank(&pool, &cfg.vpngate.countries, cfg.vpngate.min_speed_mbps);
+    let live_count = pool
+        .iter()
+        .filter(|s| s.last_seen > crate::models::now_ts() - 3600)
+        .count();
     drop(pool);
     let top: Vec<Value> = ranked
         .iter()
@@ -214,6 +222,7 @@ async fn vpngate(State(state): State<Arc<AppState>>) -> Response {
                 "country": s.country_long, "country_code": s.country_short,
                 "sessions": s.sessions, "uptime_secs": s.uptime_secs,
                 "logs_kept": s.logs_kept, "operator": s.operator,
+                "last_seen": s.last_seen,
             })
         })
         .collect();
@@ -237,7 +246,8 @@ async fn vpngate(State(state): State<Arc<AppState>>) -> Response {
     Json(json!({
         "enabled": cfg.vpngate.enabled,
         "pool_ts": state.vpn_pool_ts.load(Ordering::Relaxed),
-        "pool_size": state.vpn_pool.read().await.len(),
+        "pool_size": live_count,
+        "pool_cached": state.vpn_pool.read().await.len(),
         "tunnels": tunnels,
         "top": top,
     }))
@@ -253,6 +263,126 @@ async fn vpngate_rebuild(State(state): State<Arc<AppState>>) -> Response {
     *state.vpn_tunnels.write().await = vec![];
     state.dirty.store(true, Ordering::Relaxed);
     Json(json!({ "ok": true, "msg": "tunnels cleared, manager will re-select" })).into_response()
+}
+
+// ------------------------------------------------------------ 3x-ui inbounds
+
+async fn xui_inbounds(State(state): State<Arc<AppState>>) -> Response {
+    let cfg = state.config().await;
+    let args = ["list".to_string(), "--db".into(), cfg.xui.db_path.clone()];
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match crate::xui::run_script(&cfg.xui, &arg_refs).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+/// Shared body for preview/link: template_id + ports (+ residential filter).
+async fn xui_body(state: &Arc<AppState>, body: Option<&Json<Value>>) -> anyhow::Result<(Vec<u16>, bool, Value)> {
+    let template_id = body
+        .and_then(|b| b.0.get("template_id"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let residential = body
+        .and_then(|b| b.0.get("residential_only"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut ports: Vec<u16> = body
+        .and_then(|b| b.0.get("ports"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_u64()).filter_map(|x| u16::try_from(x).ok()).collect())
+        .unwrap_or_default();
+    if ports.is_empty() {
+        ports = collect_port_entries(state)
+            .await
+            .iter()
+            .filter(|e| !residential || e.residential)
+            .map(|e| e.port)
+            .collect();
+    }
+    let entries = crate::xui::entries_for(state, &ports, residential).await;
+    Ok((ports, residential, json!({ "template_id": template_id, "entries": entries })))
+}
+
+async fn xui_preview(
+    State(state): State<Arc<AppState>>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let cfg = state.config().await;
+    let (_ports, _resi, payload) = match xui_body(&state, body.as_ref()).await {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    };
+    let template_id = payload["template_id"].as_i64().unwrap_or(0);
+    let entries = payload["entries"].to_string();
+    let args: Vec<String> = crate::xui::script_args(&cfg.xui, "preview", template_id, &entries);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match crate::xui::run_script(&cfg.xui, &arg_refs).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+async fn xui_link(State(state): State<Arc<AppState>>, body: Option<Json<Value>>) -> Response {
+    let mut cfg = state.config().await;
+    if let Some(h) = body.as_ref().and_then(|b| b.0.get("host")).and_then(|v| v.as_str()) {
+        if !h.is_empty() {
+            cfg.xui.host = h.to_string();
+        }
+    }
+    let (_ports, _resi, payload) = match xui_body(&state, body.as_ref()).await {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    };
+    let template_id = payload["template_id"].as_i64().unwrap_or(0);
+    let entries = payload["entries"].to_string();
+    if entries == "[]" {
+        return (StatusCode::BAD_REQUEST, "no fanout ports to link").into_response();
+    }
+    let args: Vec<String> = crate::xui::script_args(&cfg.xui, "link", template_id, &entries);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match crate::xui::run_script(&cfg.xui, &arg_refs).await {
+        Ok(mut v) => {
+            let note = if cfg.xui.auto_restart {
+                crate::xui::restart_xui().await
+            } else {
+                "auto_restart disabled".to_string()
+            };
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("restart".into(), json!(note));
+            }
+            Json(v).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
+}
+
+async fn xui_unlink(State(state): State<Arc<AppState>>) -> Response {
+    let cfg = state.config().await;
+    let args = [
+        "unlink".to_string(),
+        "--db".into(),
+        cfg.xui.db_path.clone(),
+        "--inbound-prefix".into(),
+        cfg.xui.inbound_prefix.clone(),
+        "--outbound-prefix".into(),
+        cfg.xui.outbound_prefix.clone(),
+    ];
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    match crate::xui::run_script(&cfg.xui, &arg_refs).await {
+        Ok(mut v) => {
+            let note = if cfg.xui.auto_restart {
+                crate::xui::restart_xui().await
+            } else {
+                "auto_restart disabled".to_string()
+            };
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("restart".into(), json!(note));
+            }
+            Json(v).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+    }
 }
 
 async fn refresh(State(state): State<Arc<AppState>>) -> Response {
@@ -330,6 +460,8 @@ async fn xui_snippet(
         .get("prefix")
         .cloned()
         .unwrap_or_else(|| "resi".to_string());
+    let mode = params.get("mode").cloned().unwrap_or_else(|| "direct".into());
+    let inbound = params.get("inbound").cloned().unwrap_or_default();
 
     let entries: Vec<PortEntry> = if let Some(csv) = params.get("ports") {
         let want: Vec<u16> = csv
@@ -343,7 +475,7 @@ async fn xui_snippet(
         all
     };
 
-    Json(snippet::build(&entries, &prefix)).into_response()
+    Json(snippet::build_with(&entries, &prefix, &mode, &inbound)).into_response()
 }
 
 async fn collect_port_entries(state: &Arc<AppState>) -> Vec<PortEntry> {
