@@ -67,11 +67,12 @@ jobs:
           mkdir -p "$DIR/backend" && cp backend/config.example.json "$DIR/backend/"
           cp install.sh uninstall.sh README.md LICENSE "$DIR/"
           tar czf "$DIR.tar.gz" "$DIR"
-          sha256sum "$DIR.tar.gz" >> SHA256SUMS
+          # 每个架构单独一个 .sha256：矩阵 job 并行上传同名文件会互相覆盖
+          ( cd . && sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256" )
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             resi-fanout-*.tar.gz
-            SHA256SUMS
+            resi-fanout-*.tar.gz.sha256

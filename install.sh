@@ -30,6 +30,7 @@ REPO_URL="${REPO_URL:-https://github.com/SectorPace/resi-fanout.git}"
 GH_REPO="${GH_REPO:-SectorPace/resi-fanout}"
 NO_FRONTEND="0"
 FROM_SOURCE="0"
+SKIP_CHECKSUM="0"
 
 log()  { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
@@ -48,6 +49,7 @@ while [ $# -gt 0 ]; do
     --no-tls)     WITH_TLS="0"; shift ;;   # 不签证书，仅本机 HTTP
     --from-source) FROM_SOURCE="1"; shift ;;
     --no-frontend) NO_FRONTEND="1"; shift ;;
+    --skip-checksum) SKIP_CHECKSUM="1"; shift ;;
     -h|--help)
       sed -n '2,12p' "$0"; exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
@@ -85,14 +87,28 @@ elif [ "${FROM_SOURCE}" != "1" ]; then
   REL_URL="https://github.com/${GH_REPO}/releases/latest/download"
   if [ -n "${TGT}" ] && curl -fsSL "${REL_URL}/resi-fanout-${TGT}.tar.gz" -o "${TMP}/app.tar.gz" 2>/dev/null; then
     # 供应链防护：先校验 sha256 再执行解压物
-    if curl -fsSL "${REL_URL}/SHA256SUMS" -o "${TMP}/SHA256SUMS" 2>/dev/null; then
-      if (cd "$TMP" && grep "resi-fanout-${TGT}.tar.gz" SHA256SUMS | sha256sum -c - >/dev/null 2>&1); then
-        green "sha256 校验通过"
+    # 区分「哈希不匹配」(篡改/损坏 → 中止) 与「校验和缺失」(旧版本 → 警告放行)
+    SUMFILE="${TMP}/resi-fanout-${TGT}.tar.gz.sha256"
+    if curl -fsSL "${REL_URL}/resi-fanout-${TGT}.tar.gz.sha256" -o "${SUMFILE}" 2>/dev/null; then
+      WANT="$(awk -v f="resi-fanout-${TGT}.tar.gz" '{for(i=1;i<=NF;i++) if($i==f){print $1; exit}}' "${SUMFILE}")"
+      if [ -z "${WANT}" ]; then
+        warn "校验和文件里没有本架构的条目，跳过完整性校验（可用 --skip-checksum 静默）"
       else
-        die "预编译包 sha256 校验失败（可能下载损坏或被篡改），已中止安装"
+        GOT="$(sha256sum "${TMP}/app.tar.gz" | awk '{print $1}')"
+        if [ "${WANT}" = "${GOT}" ]; then
+          green "sha256 校验通过"
+        elif [ "${SKIP_CHECKSUM}" = "1" ]; then
+          warn "sha256 不匹配，但指定了 --skip-checksum，继续安装（请自行确认来源可信）"
+        else
+          die "预编译包 sha256 校验失败
+  期望: ${WANT}
+  实际: ${GOT}
+  可能下载损坏或被篡改，已中止安装。
+  确认来源可信可用 --skip-checksum 跳过，或用 --from-source 从源码安装。"
+        fi
       fi
     else
-      warn "未能获取 SHA256SUMS，跳过完整性校验"
+      warn "未提供该架构的校验和文件，跳过完整性校验（可用 --skip-checksum 静默）"
     fi
     log "downloaded prebuilt release for ${TGT} — installing (no toolchain needed)"
     tar xzf "${TMP}/app.tar.gz" -C "$TMP"
