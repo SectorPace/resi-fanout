@@ -248,6 +248,106 @@ export function renderVpngate(root: HTMLElement): void {
       }, "重新选点"),
       el("span", { id: "vg-hint", class: "dim" })
     ),
+    el("div", { id: "vg-tunnels" }),
+    el("h3", {}, "候选服务器（按 Score 排序，前 50）"),
+    el("div", { id: "vg-pool" })
+  );
+
+  async function reload(): Promise<void> {
+    let info: VpngateInfo;
+    const hint = document.getElementById("vg-hint");
+    try {
+      info = await api.vpngate();
+    } catch (e) {
+      const t = document.getElementById("vg-tunnels");
+      if (t) t.replaceChildren(el("div", { class: "error" }, String(e)));
+      return;
+    }
+    if (hint) {
+      const m = (info as unknown as { meta?: { source?: string; rows?: number; at?: number } }).meta;
+      const src = m?.source ? ` · 源 ${m.source.split("/")[2] ?? m.source}` : "";
+      hint.textContent = info.enabled
+        ? ` 已启用 · 在线 ${info.pool_size} 台 · 累计缓存 ${info.pool_cached} 台${src} · 更新 ${fmtTs2(info.pool_ts)}`
+        : " 未启用：在「配置」页开启 vpngate.enabled 并安装 openvpn";
+    }
+    const tb = document.getElementById("vg-tunnels");
+    if (tb) {
+      // WARP / MASQUE 的出口在「CF WARP」页展示，这里只列 VPN Gate 中继
+      const own = info.tunnels.filter((t) => t.server_key !== "warp" && t.server_key !== "masque");
+      tb.replaceChildren(
+        el(
+          "table",
+          { class: "tbl" },
+          el("thead", {}, el("tr", {},
+            el("th", {}, "本地端口"), el("th", {}, "服务器"), el("th", {}, "出口国家"),
+            el("th", {}, "ISP"), el("th", {}, "延迟"), el("th", {}, "隧道状态"), el("th", {}, "出口类型")
+          )),
+          el("tbody", {},
+            ...(own.length
+              ? own.map((t) => el("tr", {},
+                  el("td", { class: "mono strong" }, String(t.local_port)),
+                  el("td", { class: "mono" }, t.hostname),
+                  el("td", {}, t.country_code || "—"),
+                  el("td", { class: "dim" }, t.isp || "—"),
+                  el("td", {}, t.latency_ms != null ? `${t.latency_ms}ms` : "—"),
+                  el("td", {}, badge(t.status, t.status === "up" ? "ok" : t.status === "spawning" ? "warn" : "err")),
+                  el("td", {}, t.residential ? badge("住宅", "res") : t.hosting === true ? badge("机房", "") : t.alive ? badge("住宅?", "res") : "—")
+                ))
+              : [el("tr", {}, el("td", { colspan: "7", class: "empty" }, info.enabled ? "隧道建立中…（首次连接约需 10-30 秒）" : "未启用"))])
+          )
+        )
+      );
+    }
+    const pb = document.getElementById("vg-pool");
+    if (pb) {
+      pb.replaceChildren(
+        el(
+          "table",
+          { class: "tbl" },
+          el("thead", {}, el("tr", {},
+            el("th", {}, "主机"), el("th", {}, "国家"), el("th", {}, "速度"),
+            el("th", {}, "Ping"), el("th", {}, "会话数"), el("th", {}, "运行时长"), el("th", {}, "日志"), el("th", {}, "Score"), el("th", {}, "上次在线")
+          )),
+          el("tbody", {},
+            ...info.top.slice(0, 50).map((s) => el("tr", {},
+              el("td", { class: "mono" }, s.hostname),
+              el("td", {}, s.country_code || "—"),
+              el("td", {}, `${s.speed_mbps} Mbps`),
+              el("td", {}, `${s.ping_ms}ms`),
+              el("td", {}, String(s.sessions)),
+              el("td", {}, fmtUptime2(s.uptime_secs)),
+              el("td", {}, s.logs_kept == null ? "—" : s.logs_kept ? badge("记录", "warn") : badge("不记录", "ok")),
+              el("td", {}, String(s.score)),
+              el("td", { class: "dim" }, s.last_seen ? fmtTs2(s.last_seen) : "缓存")
+            ))
+          )
+        )
+      );
+    }
+  }
+
+  function fmtTs2(ts?: number | null): string {
+    return ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
+  }
+  function fmtUptime2(secs: number): string {
+    const d = Math.floor(secs / 86400);
+    const h = Math.floor((secs % 86400) / 3600);
+    return d > 0 ? `${d}天${h}时` : `${h}时`;
+  }
+
+  void reload();
+  const timer = window.setInterval(() => void reload(), 15000);
+  const obs = new MutationObserver(() => {
+    if (!document.body.contains(root)) {
+      window.clearInterval(timer);
+      obs.disconnect();
+    }
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
+}
+
+export function renderWarp(root: HTMLElement): void {
+  root.replaceChildren(
     el(
       "fieldset",
       {},
@@ -287,10 +387,10 @@ export function renderVpngate(root: HTMLElement): void {
         }, "断开"),
         el("button", {
           onclick: () => {
-            const ob = (window as unknown as { __warpOutbound?: unknown }).__warpOutbound;
-            if (!ob) { toast("还没有 WARP 配置", false); return; }
             const ta = document.getElementById("warp-out") as HTMLTextAreaElement | null;
-            if (ta) void navigator.clipboard.writeText(ta.value);
+            if (!ta || !ta.value) { toast("还没有 WARP 配置", false); return; }
+            void navigator.clipboard.writeText(ta.value);
+            toast("已复制 Xray 出站");
           }
         }, "复制 Xray 出站")
       ),
@@ -300,7 +400,7 @@ export function renderVpngate(root: HTMLElement): void {
         rows: "6",
         style: "width:100%",
         placeholder: "[Interface]\nPrivateKey = ...\nAddress = 172.16.0.2/32\n\n[Peer]\nPublicKey = bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=\nEndpoint = engage.cloudflareclient.com:2408\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = 60"
-      }, ""),
+      }),
       el(
         "div",
         { class: "actions" },
@@ -316,54 +416,53 @@ export function renderVpngate(root: HTMLElement): void {
         }, "导入这份配置"),
         el("small", { class: "dim" }, "支持 wgcf 生成的配置或手写 WireGuard 配置；私钥只存在本机 /var/lib/resi-fanout/warp/warp.conf")
       ),
-      el("textarea", { id: "warp-out", class: "code", rows: "8", style: "width:100%;display:none" }),
-      el(
-        "fieldset",
-        { style: "border:0;padding:0;margin:0" },
-        el("legend", {}, "从 Clash / Mihomo 配置导入 MASQUE 节点"),
-        el("textarea", {
-          id: "clash-yaml",
-          class: "code",
-          rows: "5",
-          style: "width:100%",
-          placeholder: "把 Clash / Mihomo 配置里的 proxies 段整段粘进来（含 type: masque 的节点）"
-        }),
-        el(
-          "div",
-          { class: "filterbar" },
-          el("select", { id: "clash-pick" }, el("option", { value: "-1" }, "先点「解析节点」")),
-          el("button", {
-            onclick: async () => {
-              const yaml = (document.getElementById("clash-yaml") as HTMLTextAreaElement).value;
-              if (!yaml.trim()) { toast("先粘贴 Clash 配置", false); return; }
-              try {
-                const r = await api.warpImportClash(yaml);
-                const sel = document.getElementById("clash-pick") as HTMLSelectElement;
-                sel.replaceChildren(
-                  ...r.nodes.map((n) =>
-                    el("option", { value: String(n.index) }, `${n.name} · ${n.server}:${n.port} · ${n.kind}`)
-                  )
-                );
-                toast(`解析到 ${r.count} 个 MASQUE/WireGuard 节点`);
-              } catch (e) { toast(String(e), false); }
-            }
-          }, "解析节点"),
-          el("button", {
-            class: "primary",
-            onclick: () => void applyClash("masque")
-          }, "按 MASQUE 应用（推荐）"),
-          el("button", {
-            onclick: () => void applyClash("wireguard")
-          }, "按 WireGuard 应用")
-        ),
-        el("small", { class: "dim" },
-          "MASQUE 节点用 Cloudflare 的多算法密钥容器，只有 Mihomo 能正确消费，因此走 Mihomo 旁挂；应用后该端口会出现在「本地端口」页并可联动 3x-ui。"),
-        el("div", { id: "clash-result" })
-      )
+      el("textarea", { id: "warp-out", class: "code", rows: "8", style: "width:100%;display:none" })
     ),
-    el("div", { id: "vg-tunnels" }),
-    el("h3", {}, "候选服务器（按 Score 排序，前 50）"),
-    el("div", { id: "vg-pool" })
+    el(
+      "fieldset",
+      {},
+      el("legend", {}, "从 Clash / Mihomo 配置导入 MASQUE 节点"),
+      el("textarea", {
+        id: "clash-yaml",
+        class: "code",
+        rows: "5",
+        style: "width:100%",
+        placeholder: "把 Clash / Mihomo 配置里的 proxies 段整段粘进来（含 type: masque 的节点）"
+      }),
+      el(
+        "div",
+        { class: "filterbar" },
+        el("select", { id: "clash-pick" }, el("option", { value: "-1" }, "先点「解析节点」")),
+        el("button", {
+          onclick: async () => {
+            const yaml = (document.getElementById("clash-yaml") as HTMLTextAreaElement).value;
+            if (!yaml.trim()) { toast("先粘贴 Clash 配置", false); return; }
+            try {
+              const r = await api.warpImportClash(yaml);
+              const sel = document.getElementById("clash-pick") as HTMLSelectElement;
+              sel.replaceChildren(
+                ...r.nodes.map((n) =>
+                  el("option", { value: String(n.index) }, `${n.name} · ${n.server}:${n.port} · ${n.kind}`)
+                )
+              );
+              toast(`解析到 ${r.count} 个 MASQUE/WireGuard 节点`);
+            } catch (e) { toast(String(e), false); }
+          }
+        }, "解析节点"),
+        el("button", {
+          class: "primary",
+          onclick: () => void applyClash("masque")
+        }, "按 MASQUE 应用（推荐）"),
+        el("button", {
+          onclick: () => void applyClash("wireguard")
+        }, "按 WireGuard 应用")
+      ),
+      el("small", { class: "dim" },
+        "MASQUE 节点用 Cloudflare 的多算法密钥容器，只有 Mihomo 能正确消费，因此走 Mihomo 旁挂；应用后该端口会出现在「本地端口」页并可联动 3x-ui。"),
+      el("div", { id: "clash-result" })
+    ),
+    el("h3", {}, "WARP / MASQUE 出口状态"),
+    el("div", { id: "warp-tunnels" })
   );
 
   async function applyClash(mode: "masque" | "wireguard"): Promise<void> {
@@ -409,107 +508,54 @@ export function renderVpngate(root: HTMLElement): void {
       if (w.xray_outbound && out) {
         out.style.display = "";
         out.value = JSON.stringify(w.xray_outbound, null, 2);
-        (window as unknown as { __warpOutbound?: unknown }).__warpOutbound = w.xray_outbound;
       }
     } catch (e) {
       box.textContent = String(e);
     }
-  }
-  void loadWarp();
-
-  async function reload(): Promise<void> {
-    let info: VpngateInfo;
-    const hint = document.getElementById("vg-hint");
+    const tb = document.getElementById("warp-tunnels");
+    if (!tb) return;
     try {
-      info = await api.vpngate();
-    } catch (e) {
-      const t = document.getElementById("vg-tunnels");
-      if (t) t.replaceChildren(el("div", { class: "error" }, String(e)));
-      return;
-    }
-    if (hint) {
-      const m = (info as unknown as { meta?: { source?: string; rows?: number; at?: number } }).meta;
-      const src = m?.source ? ` · 源 ${m.source.split("/")[2] ?? m.source}` : "";
-      hint.textContent = info.enabled
-        ? ` 已启用 · 在线 ${info.pool_size} 台 · 累计缓存 ${info.pool_cached} 台${src} · 更新 ${fmtTs2(info.pool_ts)}`
-        : " 未启用：在「配置」页开启 vpngate.enabled 并安装 openvpn";
-    }
-    const tb = document.getElementById("vg-tunnels");
-    if (tb) {
+      const vg = await api.vpngate();
+      const rows = vg.tunnels.filter((t) => t.server_key === "warp" || t.server_key === "masque");
       tb.replaceChildren(
         el(
           "table",
           { class: "tbl" },
           el("thead", {}, el("tr", {},
-            el("th", {}, "本地端口"), el("th", {}, "服务器"), el("th", {}, "出口国家"),
-            el("th", {}, "ISP"), el("th", {}, "延迟"), el("th", {}, "隧道状态"), el("th", {}, "出口类型")
+            el("th", {}, "本地端口"), el("th", {}, "出口"), el("th", {}, "出口国家"),
+            el("th", {}, "ISP"), el("th", {}, "延迟"), el("th", {}, "状态"), el("th", {}, "类型")
           )),
           el("tbody", {},
-            ...(info.tunnels.length
-              ? info.tunnels.map((t) => el("tr", {},
+            ...(rows.length
+              ? rows.map((t) => el("tr", {},
                   el("td", { class: "mono strong" }, String(t.local_port)),
-                  el("td", { class: "mono" }, t.hostname),
+                  el("td", { class: "mono" }, t.exit_ip || t.tun_ip || "—"),
                   el("td", {}, t.country_code || "—"),
                   el("td", { class: "dim" }, t.isp || "—"),
                   el("td", {}, t.latency_ms != null ? `${t.latency_ms}ms` : "—"),
-                  el("td", {}, badge(t.status, t.status === "up" ? "ok" : t.status === "spawning" ? "warn" : "err")),
-                  el("td", {}, t.residential ? badge("住宅", "res") : t.hosting === true ? badge("机房", "") : t.alive ? badge("住宅?", "res") : "—")
+                  el("td", {}, badge(t.status, t.status === "up" ? "ok" : "warn")),
+                  el("td", {},
+                    t.server_key === "warp" ? badge("WARP WireGuard", "acc") : badge("MASQUE", "acc"),
+                    " ",
+                    t.residential ? badge("住宅", "res") : t.hosting === true ? badge("机房", "") : "")
                 ))
-              : [el("tr", {}, el("td", { colspan: "7", class: "dim" }, info.enabled ? "隧道建立中…（首次连接约需 10-30 秒）" : "未启用"))])
+              : [el("tr", {}, el("td", { colspan: "7", class: "empty" }, "暂无 WARP / MASQUE 出口"))])
           )
         )
       );
-    }
-    const pb = document.getElementById("vg-pool");
-    if (pb) {
-      pb.replaceChildren(
-        el(
-          "table",
-          { class: "tbl" },
-          el("thead", {}, el("tr", {},
-            el("th", {}, "主机"), el("th", {}, "国家"), el("th", {}, "速度"),
-            el("th", {}, "Ping"), el("th", {}, "会话数"), el("th", {}, "运行时长"), el("th", {}, "日志"), el("th", {}, "Score"), el("th", {}, "上次在线")
-          )),
-          el("tbody", {},
-            ...info.top.slice(0, 50).map((s) => el("tr", {},
-              el("td", { class: "mono" }, s.hostname),
-              el("td", {}, s.country_code || "—"),
-              el("td", {}, `${s.speed_mbps} Mbps`),
-              el("td", {}, `${s.ping_ms}ms`),
-              el("td", {}, String(s.sessions)),
-              el("td", {}, fmtUptime2(s.uptime_secs)),
-              el("td", {}, s.logs_kept == null ? "—" : s.logs_kept ? badge("记录", "warn") : badge("不记录", "ok")),
-              el("td", {}, String(s.score)),
-              el("td", { class: "dim" }, s.last_seen ? fmtTs2(s.last_seen) : "缓存")
-            ))
-          )
-        )
-      );
+    } catch {
+      // vpngate 接口失败不影响 WARP 状态显示
     }
   }
-
-  function fmtTs2(ts?: number | null): string {
-    return ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
-  }
-  function fmtUptime2(secs: number): string {
-    const d = Math.floor(secs / 86400);
-    const h = Math.floor((secs % 86400) / 3600);
-    return d > 0 ? `${d}天${h}时` : `${h}时`;
-  }
-
-  void reload();
   void loadWarp();
-  const timer = window.setInterval(() => {
-    void reload();
-    void loadWarp();
-  }, 15000);
-  const obs = new MutationObserver(() => {
+  const warpTimer = window.setInterval(() => void loadWarp(), 15000);
+  const warpObs = new MutationObserver(() => {
     if (!document.body.contains(root)) {
-      window.clearInterval(timer);
-      obs.disconnect();
+      window.clearInterval(warpTimer);
+      warpObs.disconnect();
     }
   });
-  obs.observe(document.body, { childList: true, subtree: true });
+  warpObs.observe(document.body, { childList: true, subtree: true });
 }
 
 export async function renderConfig(root: HTMLElement): Promise<void> {

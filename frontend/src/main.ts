@@ -1,6 +1,6 @@
 import { api, fmtTs, fmtUptime, getKey, setKey, type Status } from "./api";
 import "./style.css";
-import { renderProxies, renderPorts, renderConfig, renderXui, renderVpngate } from "./views";
+import { renderProxies, renderPorts, renderConfig, renderXui, renderVpngate, renderWarp } from "./views";
 
 export function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -148,6 +148,7 @@ function buildShell(): void {
       el("button", { class: "tab", "data-tab": "proxies", onclick: () => nav("proxies") }, "节点池"),
       el("button", { class: "tab", "data-tab": "ports", onclick: () => nav("ports") }, "本地端口"),
       el("button", { class: "tab", "data-tab": "vpngate", onclick: () => nav("vpngate") }, "VPN Gate"),
+      el("button", { class: "tab", "data-tab": "warp", onclick: () => nav("warp") }, "CF WARP"),
       el("button", { class: "tab", "data-tab": "config", onclick: () => nav("config") }, "配置"),
       el("button", { class: "tab", "data-tab": "xui", onclick: () => nav("xui") }, "接入 3x-ui")
     ),
@@ -180,6 +181,7 @@ function buildShell(): void {
       el("section", { id: "view-proxies", class: "view", style: "display:none" }),
       el("section", { id: "view-ports", class: "view", style: "display:none" }),
       el("section", { id: "view-vpngate", class: "view", style: "display:none" }),
+      el("section", { id: "view-warp", class: "view", style: "display:none" }),
       el("section", { id: "view-config", class: "view", style: "display:none" }),
       el("section", { id: "view-xui", class: "view", style: "display:none" })
     ),
@@ -194,6 +196,7 @@ function buildShell(): void {
   void renderConfig(document.getElementById("view-config") as HTMLElement);
   renderXui(document.getElementById("view-xui") as HTMLElement);
   renderVpngate(document.getElementById("view-vpngate") as HTMLElement);
+  renderWarp(document.getElementById("view-warp") as HTMLElement);
 }
 
 buildShell();
