@@ -125,9 +125,35 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
 
     #[cfg(feature = "tls")]
     if cfg.server.tls.enabled {
-        let handle = crate::tls::load(&cfg.server.tls).await?;
-        crate::tls::serve(handle, listener, app, cfg.server.tls.clone()).await?;
-        return Ok(());
+        match crate::tls::load(&cfg.server.tls).await {
+            Ok(handle) => {
+                crate::tls::serve(handle, listener, app, cfg.server.tls.clone()).await?;
+                return Ok(());
+            }
+            Err(e) => {
+                // A broken certificate must not take the service down (that
+                // would turn into a systemd restart loop). Fall back to
+                // localhost-only HTTP so the UI stays reachable, and never
+                // downgrade a public bind to plaintext.
+                tracing::error!(
+                    error = %e,
+                    "TLS 证书加载失败 —— 降级为仅本机 HTTP；修好证书后 rf restart 即可恢复 HTTPS"
+                );
+                let host = cfg.server.listen.rsplit_once(':').map(|(h, _)| h).unwrap_or("127.0.0.1");
+                let port = cfg
+                    .server
+                    .listen
+                    .rsplit_once(':')
+                    .map(|(_, p)| p.parse::<u16>().unwrap_or(7654))
+                    .unwrap_or(7654);
+                if host == "0.0.0.0" || host == "::" || host.is_empty() {
+                    let fallback = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+                    tracing::warn!(port, "仅在 127.0.0.1 上以 HTTP 提供服务");
+                    axum::serve(fallback, app).await?;
+                    return Ok(());
+                }
+            }
+        }
     }
     axum::serve(listener, app).await?;
     Ok(())

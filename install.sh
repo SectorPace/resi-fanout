@@ -210,24 +210,45 @@ try_issue_cert() {
     lego run --accept-tos --server letsencrypt --http --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2       || { warn "证书申请失败：80 端口需可从公网访问（被占用就停掉占用者，或改用 DNS-01）—— 降级为仅本机 HTTP"; return 1; }
   fi
 
-  # lego 各版本落盘位置不同（v4 顶层 <ip>.crt/<ip>.key，v5 可能带子目录
-  # 或只输出合并的 .pem），所以递归查找并按内容校验
-  CRT=""
-  KEY=""
-  for f in $(find "${TLS_DIR}" -type f \( -name '*.crt' -o -name '*.pem' \) 2>/dev/null); do
-    if grep -q "BEGIN CERTIFICATE" "$f" 2>/dev/null; then CRT="$f"; break; fi
+  # lego 各版本落盘位置不同（v4 顶层 <ip>.crt/<ip>.key，v5 可能带子目录或
+  # 只输出合并 pem）。关键是 cert 与 key 必须来自同一目录同一份，否则
+  # rustls 会因密钥不匹配拒绝加载 → 服务起不来。
+  CRT=""; KEY=""
+  # 优先：同名成对（取最新修改的一对）
+  for f in $(find "${TLS_DIR}" -type f -name '*.key' 2>/dev/null | while read -r x; do echo "$(stat -c %Y "$x" 2>/dev/null || echo 0) $x"; done | sort -rn | cut -d' ' -f2-); do
+    grep -q "PRIVATE KEY" "$f" 2>/dev/null || continue
+    stem="${f%.key}"
+    for c in "${stem}.crt" "${stem}.pem"; do
+      if [ -f "$c" ] && grep -q "BEGIN CERTIFICATE" "$c" 2>/dev/null; then
+        KEY="$f"; CRT="$c"; break 2
+      fi
+    done
   done
-  for f in $(find "${TLS_DIR}" -type f -name '*.key' 2>/dev/null); do
-    if grep -q "PRIVATE KEY" "$f" 2>/dev/null; then KEY="$f"; break; fi
-  done
+  # 兜底：任意证书 + 任意私钥（内容特征校验）
+  if [ -z "$KEY" ]; then
+    for f in $(find "${TLS_DIR}" -type f \( -name '*.crt' -o -name '*.pem' \) 2>/dev/null); do
+      grep -q "BEGIN CERTIFICATE" "$f" 2>/dev/null && { CRT="$f"; break; }
+    done
+    for f in $(find "${TLS_DIR}" -type f -name '*.key' 2>/dev/null); do
+      grep -q "PRIVATE KEY" "$f" 2>/dev/null && { KEY="$f"; break; }
+    done
+  fi
   if [ -n "${CRT}" ] && [ -z "${KEY}" ] && command -v openssl >/dev/null 2>&1; then
-    # 只有合并 pem：从里面拆出私钥
     openssl pkey -in "${CRT}" -out "${TLS_DIR}/privkey.pem" >/dev/null 2>&1 || true
     [ -s "${TLS_DIR}/privkey.pem" ] && KEY="${TLS_DIR}/privkey.pem"
   fi
   if [ -z "${CRT}" ] || [ -z "${KEY}" ]; then
     warn "未在 ${TLS_DIR} 找到可用的证书/私钥（lego 输出: $(ls -R "${TLS_DIR}" 2>/dev/null | tr '\n' ' ' | cut -c1-160)）—— 降级为仅本机 HTTP"
     return 1
+  fi
+  # 校验配对：比对公钥指纹（RSA/EC 通用，lego 默认发 ECDSA）
+  if command -v openssl >/dev/null 2>&1; then
+    C_PUB="$(openssl x509 -in "${CRT}" -noout -pubkey 2>/dev/null | openssl md5 2>/dev/null)"
+    K_PUB="$(openssl pkey -in "${KEY}" -pubout 2>/dev/null | openssl md5 2>/dev/null)"
+    if [ -n "${C_PUB}" ] && [ -n "${K_PUB}" ] && [ "$C_PUB" != "$K_PUB" ]; then
+      warn "证书与私钥不匹配（${CRT##*/} vs ${KEY##*/}）—— 降级为仅本机 HTTP"
+      return 1
+    fi
   fi
   cp -f "${CRT}" "${TLS_DIR}/fullchain.pem"
   cp -f "${KEY}" "${TLS_DIR}/privkey.pem"

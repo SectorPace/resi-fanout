@@ -1,6 +1,6 @@
 [package]
 name = "resi-fanout"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 description = "Fetch free/residential proxies, health-check them, fan each one out to a local port, and hand the ports to 3x-ui as Xray outbounds."
 license = "MIT"
