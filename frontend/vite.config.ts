@@ -1,6 +1,8 @@
 import { defineConfig } from "vite";
 
 export default defineConfig({
+  // relative asset URLs so the UI also works under a random base_path
+  base: "./",
   build: {
     outDir: "dist",
     emptyOutDir: true

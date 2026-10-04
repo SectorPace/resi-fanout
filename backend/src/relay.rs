@@ -162,11 +162,34 @@ async fn desired_listeners(state: &AppState, cfg: &crate::config::Config) -> Vec
 /// Bind one fanout port and relay every session through `dialer`.
 /// Used by both the proxy supervisor and the VPN Gate tunnel manager.
 pub async fn run_listener(state: Arc<AppState>, port: u16, dialer: Dialer) -> Result<()> {
+    run_listener_inner(state, port, dialer, None).await
+}
+
+/// Same, but reports a successful bind through `ready` — callers that keep
+/// their own "already listening" bookkeeping need to know the bind worked.
+pub async fn run_listener_signaled(
+    state: Arc<AppState>,
+    port: u16,
+    dialer: Dialer,
+    ready: tokio::sync::oneshot::Sender<()>,
+) -> Result<()> {
+    run_listener_inner(state, port, dialer, Some(ready)).await
+}
+
+async fn run_listener_inner(
+    state: Arc<AppState>,
+    port: u16,
+    dialer: Dialer,
+    ready: Option<tokio::sync::oneshot::Sender<()>>,
+) -> Result<()> {
     let bind = state.config().await.fanout.bind;
     let addr = format!("{bind}:{port}");
     let listener = TcpListener::bind(&addr)
         .await
         .map_err(|e| anyhow!("bind {addr}: {e}"))?;
+    if let Some(tx) = ready {
+        let _ = tx.send(());
+    }
     info!(%addr, dialer = ?dialer, "fanout port listening");
     loop {
         let (sock, peer) = listener.accept().await?;

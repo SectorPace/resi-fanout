@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use serde_json::Value;
+use tracing::warn;
 
 use crate::config::SourceCfg;
 use crate::models::{Protocol, ProxyInfo};
@@ -11,6 +12,9 @@ pub struct FetchOutcome {
     pub proxies: Vec<ProxyInfo>,
     pub error: Option<String>,
 }
+
+/// Hard cap on rows accepted from a single source.
+const MAX_ROWS_PER_SOURCE: usize = 20_000;
 
 pub fn build_client() -> reqwest::Client {
     reqwest::Client::builder()
@@ -64,11 +68,16 @@ async fn fetch_one(client: &reqwest::Client, s: &SourceCfg) -> FetchOutcome {
         Ok(t) => t,
         Err(e) => return fail(format!("body: {e}")),
     };
-    let proxies = match s.kind.as_str() {
+    let mut proxies = match s.kind.as_str() {
         "monosans" => parse_monosans(&text),
         "geonode" => parse_geonode(&text),
         _ => parse_text(&text, s.protocol),
     };
+    // a runaway or hostile list must not be able to blow up memory
+    if proxies.len() > MAX_ROWS_PER_SOURCE {
+        warn!(name = %s.name, got = proxies.len(), "source row cap applied");
+        proxies.truncate(MAX_ROWS_PER_SOURCE);
+    }
     FetchOutcome {
         name: s.name.clone(),
         proxies,

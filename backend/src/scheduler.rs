@@ -13,11 +13,18 @@ use crate::state::AppState;
 pub fn spawn(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(10));
+        let mut last_save = std::time::Instant::now() - Duration::from_secs(60);
         loop {
             tick.tick().await;
-            if state.dirty.swap(false, Ordering::Relaxed) {
-                if let Err(e) = state.save_state().await {
-                    warn!(error = %e, "state save failed");
+            // a check round dirties the state constantly; with a few thousand
+            // proxies every write is megabytes, so keep a floor between saves
+            // (run_cycle still forces a save when it finishes)
+            if state.dirty.swap(false, Ordering::Relaxed)
+                && last_save.elapsed() >= Duration::from_secs(30)
+            {
+                match state.save_state().await {
+                    Ok(()) => last_save = std::time::Instant::now(),
+                    Err(e) => warn!(error = %e, "state save failed"),
                 }
             }
             let cfg = state.config().await;

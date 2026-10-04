@@ -641,6 +641,21 @@ async fn put_config(
     if cfg.fanout.max_ports == 0 || cfg.fanout.base_port as u32 + cfg.fanout.max_ports > 65536 {
         return (StatusCode::BAD_REQUEST, "bad fanout port range").into_response();
     }
+    // an invalid base_path would panic while registering routes on the next
+    // start, so reject it at write time
+    let base = normalize_base(&cfg.server.base_path);
+    if !base.is_empty()
+        && !base
+            .trim_start_matches('/')
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            "base_path may only contain letters, digits, - and _",
+        )
+            .into_response();
+    }
     if tokio::net::TcpListener::bind(&cfg.server.listen).await.is_err() {
         // not fatal, but worth flagging: current listener keeps the old addr
         tracing::warn!(listen = %cfg.server.listen, "new listen addr not bindable now (applies after restart)");

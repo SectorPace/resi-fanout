@@ -140,6 +140,18 @@ export interface Config {
 
 const KEY_STORE = "resi_fanout_api_key";
 
+/**
+ * The UI can be served under a random prefix (server.base_path, set by
+ * `install.sh --with-tls`). Resolve the API prefix from where index.html
+ * actually lives, otherwise every request would hit the root and 404.
+ */
+const BASE_PATH = (() => {
+  const p = location.pathname.replace(/\/+$/, "");
+  return p === "" ? "" : p;
+})();
+
+const url = (path: string): string => `${BASE_PATH}${path}`;
+
 export function getKey(): string {
   return localStorage.getItem(KEY_STORE) || "";
 }
@@ -152,7 +164,8 @@ async function req(method: string, path: string, body?: unknown): Promise<any> {
   const key = getKey();
   if (key) headers["Authorization"] = `Bearer ${key}`;
   if (body !== undefined) headers["Content-Type"] = "application/json";
-  const res = await fetch(path, {
+  // every API call goes through here, so the base prefix is applied once
+  const res = await fetch(url(path), {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body)

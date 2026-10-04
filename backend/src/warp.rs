@@ -881,23 +881,33 @@ static MASQUE_SLOT: std::sync::OnceLock<std::sync::Mutex<Option<tokio::process::
     std::sync::OnceLock::new();
 
 /// Expose the MASQUE sidecar's local socks port as a fanout port.
+/// The port is recorded only after the listener actually bound, so a bind
+/// failure (e.g. an orphaned mihomo still holding the port after a service
+/// restart) is retried on the next tick instead of being remembered forever.
 async fn ensure_proxy_listener(state: &Arc<AppState>, port: u16) {
     static PROXY_LISTENERS: std::sync::OnceLock<std::sync::Mutex<Vec<u16>>> =
         std::sync::OnceLock::new();
     let set = PROXY_LISTENERS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
-    {
-        let mut guard = set.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.contains(&port) {
-            return;
-        }
-        guard.push(port);
+    if set.lock().unwrap_or_else(|e| e.into_inner()).contains(&port) {
+        return;
     }
     let st = state.clone();
-    let dialer = Dialer::Proxy(format!("socks5://127.0.0.1:{port}"));
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        let _ = relay::run_listener(st.clone(), port, dialer).await;
+        let dialer = Dialer::Proxy(format!("socks5://127.0.0.1:{port}"));
+        if let Err(e) = relay::run_listener_signaled(st, port, dialer, tx).await {
+            warn!(port, error = %e, "masque fanout port bind failed (will retry)");
+        }
     });
-    info!(port, "masque fanout port listening");
+    // resolves only after the bind succeeded (or the task died)
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok(())) => {
+            set.lock().unwrap_or_else(|x| x.into_inner()).push(port);
+            info!(port, "masque fanout port listening");
+        }
+        Ok(Err(_)) => warn!(port, "masque listener died before binding"),
+        Err(_) => warn!(port, "masque listener bind timed out"),
+    }
 }
 
 async fn classify_masque(state: &Arc<AppState>, port: u16) {

@@ -211,16 +211,7 @@ if [ "${WITH_TLS}" = "1" ]; then
 
   BASE_PATH="/$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' 
 ')"
-  log "开启 HTTPS：0.0.0.0:${API_PORT}，随机路径 ${BASE_PATH}"
-  python3 - "${CONF_DIR}/config.json" "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/privkey.pem" "${BASE_PATH}" "${API_PORT}" <<'PYEOF2'
-import json, sys
-cfg_path, cert, key, base, port = sys.argv[1:6]
-c = json.load(open(cfg_path))
-c["server"]["tls"] = {"enabled": True, "cert_path": cert, "key_path": key, "reload_secs": 300}
-c["server"]["base_path"] = base
-c["server"]["listen"] = f"0.0.0.0:{port}"
-json.dump(c, open(cfg_path, "w"), indent=2, ensure_ascii=False)
-PYEOF2
+  log "证书就绪，稍后写入配置：https://<你的IP>:${API_PORT}${BASE_PATH}"
 
   # renewal: 6-day certs, so renew twice a day; the service hot-reloads it
   log "注册自动续期定时器（resi-fanout-acme.timer）"
@@ -348,6 +339,20 @@ chown -R "${APP}:${APP}" "${DATA_DIR}"
 chown    root:"${APP}"  "${CONF_DIR}" 2>/dev/null || true
 chmod 750 "${CONF_DIR}" 2>/dev/null || true
 
+# TLS 证书要等 config.json 存在之后才能写进去
+if [ "${WITH_TLS}" = "1" ]; then
+  python3 - "${CONF_DIR}/config.json" "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/privkey.pem" "${BASE_PATH}" "${API_PORT}" <<'PYEOF2'
+import json, sys
+cfg_path, cert, key, base, port = sys.argv[1:6]
+c = json.load(open(cfg_path))
+c["server"]["tls"] = {"enabled": True, "cert_path": cert, "key_path": key, "reload_secs": 300}
+c["server"]["base_path"] = base
+c["server"]["listen"] = f"0.0.0.0:{port}"
+json.dump(c, open(cfg_path, "w"), indent=2, ensure_ascii=False)
+PYEOF2
+  chown root:"${APP}" "${CONF_DIR}/config.json" 2>/dev/null || true
+fi
+
 log "writing systemd unit ${SERVICE}"
 CAPS=""
 if [ "${WITH_VPNGATE}" = "1" ]; then
@@ -393,7 +398,7 @@ cat <<EOF
 
 ============================================================
  ${APP} installed
-  API/UI : http://127.0.0.1:${API_PORT}  (web root: ${PREFIX}/web)
+  API/UI : ${TLS_ENABLED:+https}${PUBLIC_IP:+://}${PUBLIC_IP:-127.0.0.1}:${API_PORT}${BASE_PATH:-}  (web root: ${PREFIX}/web)
   API key: ${API_KEY_NOW:-<empty>}
   config : ${CONF_DIR}/config.json
   data   : ${DATA_DIR}
