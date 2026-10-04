@@ -182,7 +182,9 @@ pub struct VpngateCfg {
 impl Default for VpngateCfg {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // openvpn is installed by default, so VPN Gate tunnels start
+            // working out of the box; flip to false in config.json if unwanted
+            enabled: true,
             base_port: 21000,
             max_servers: 3,
             countries: vec![],

@@ -146,8 +146,8 @@ sudo bash install.sh --with-tls
 [VPN Gate](https://www.vpngate.net) 是筑波大学的学术实验项目，公共中继里包含大量**家庭宽带的志愿者节点**（日本/韩国/美国尤多），适合补充海外住宅线路。开启后每台选中的服务器会拉起一条 OpenVPN 旁挂隧道，**每条隧道一个本地 SOCKS 端口**（默认 `21000+`），与代理端口一起统一接入 3x-ui。
 
 ```bash
-sudo bash install.sh --with-vpngate     # 装 openvpn + 启用
-# 或手动: apt install openvpn 后把 config.json 里 vpngate.enabled 改为 true 并重启服务
+# openvpn 与 VPN Gate 均已默认安装并启用；
+# 如不想要隧道，把 config.json 里 vpngate.enabled 改为 false 并重启服务
 ```
 
 工作方式：

@@ -34,7 +34,7 @@
     "protocols": []
   },
   "vpngate": {
-    "enabled": false,
+    "enabled": true,
     "base_port": 21000,
     "max_servers": 3,
     "countries": [],

@@ -115,14 +115,10 @@ install_pkgs() {
   esac
 }
 
-log "installing base packages (curl git ca-certificates python3)"
+log "installing base packages (curl git ca-certificates python3 openvpn)"
 { apt-get update -y >/dev/null 2>&1 || true; } 2>/dev/null || true
-install_pkgs curl git ca-certificates python3 || warn "continue anyway"
-
-if [ "${WITH_VPNGATE}" = "1" ]; then
-  log "installing openvpn (VPN Gate sidecar tunnels)"
-  install_pkgs openvpn iproute2 || warn "openvpn install failed — VPN Gate tunnels will not start"
-fi
+install_pkgs curl git ca-certificates python3 openvpn iproute2 \
+  || warn "some packages failed (VPN Gate tunnels need openvpn)"
 
 if [ "${WITH_WARP}" = "1" ]; then
   log "installing wireguard-tools (Cloudflare WARP tunnel)"
@@ -354,10 +350,8 @@ PYEOF2
 fi
 
 log "writing systemd unit ${SERVICE}"
-CAPS=""
-if [ "${WITH_VPNGATE}" = "1" ]; then
-  CAPS=$'AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW'
-fi
+# VPN Gate / WARP tunnels need NET_ADMIN (openvpn is installed by default)
+CAPS=$'AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW'
 cat > "/etc/systemd/system/${SERVICE}" <<EOF
 [Unit]
 Description=Resi-Fanout: residential proxy fanout for 3x-ui
