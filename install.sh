@@ -448,7 +448,15 @@ c["server"]["base_path"] = base
 c["server"]["listen"] = f"0.0.0.0:{port}"
 json.dump(c, open(cfg_path, "w"), indent=2, ensure_ascii=False)
 PYEOF2
-  chown root:"${APP}" "${CONF_DIR}/config.json" 2>/dev/null || true
+fi
+
+# 权限修正（无条件执行）：配置与证书必须对服务账号可读，
+# 否则以专用用户运行时直接 EACCEX 启动失败 / TLS 静默降级
+chown root:"${APP}" "${CONF_DIR}/config.json" 2>/dev/null || true
+if [ -d "${TLS_DIR}" ]; then
+  chown -R root:"${APP}" "${TLS_DIR}" 2>/dev/null || true
+  chmod 750 "${TLS_DIR}" 2>/dev/null || true
+  chmod 640 "${TLS_DIR}/privkey.pem" 2>/dev/null || true
 fi
 
 log "installing global CLI: /usr/local/bin/rf"
@@ -665,6 +673,16 @@ for _ in $(seq 1 15); do
   systemctl is-active --quiet "${SERVICE}" || break
   sleep 1
 done
+
+# 预检：服务账号能否读取配置与证书（否则运行时会 EACCES）
+if command -v runuser >/dev/null 2>&1; then
+  if ! runuser -u "${APP}" -- test -r "${CONF_DIR}/config.json"; then
+    warn "服务账号 ${APP} 读不到 ${CONF_DIR}/config.json，服务将无法启动；请执行：chown root:${APP} ${CONF_DIR}/config.json"
+  fi
+  if [ -f "${TLS_DIR}/privkey.pem" ] && ! runuser -u "${APP}" -- test -r "${TLS_DIR}/privkey.pem"; then
+    warn "服务账号 ${APP} 读不到 privkey.pem，HTTPS 会降级为 HTTP；请执行：chown root:${APP} ${TLS_DIR}/privkey.pem"
+  fi
+fi
 
 if systemctl is-active --quiet "${SERVICE}" && \
    (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -q ":${LISTEN_PORT}[[:space:]]"; then
