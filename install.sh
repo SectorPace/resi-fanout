@@ -200,13 +200,13 @@ try_issue_cert() {
   mkdir -p "${TLS_DIR}"
   # lego v5：旗标放在 run 子命令之后；--server 支持 letsencrypt 短代码；
   # run 兼具续期（--renew-days 默认按证书生命周期的 1/3 自动判断）
-  ACME_ARGS="--accept-tos --server letsencrypt --profile shortlived --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2"
+  ACME_ARGS="--accept-tos --server letsencrypt --profile shortlived --http --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2"
   [ -n "${ACME_EMAIL:-}" ] && ACME_ARGS="--email ${ACME_EMAIL} ${ACME_ARGS}"
 
   log "为 ${PUBLIC_IP} 申请证书（HTTP-01 需要 80 端口可从公网访问）"
   if ! lego run ${ACME_ARGS}; then
     warn "shortlived profile 申请失败，改用默认 profile 重试"
-    lego run --accept-tos --server letsencrypt --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2       || { warn "证书申请失败：80 端口需可从公网访问（被占用就停掉占用者，或改用 DNS-01）—— 降级为仅本机 HTTP"; return 1; }
+    lego run --accept-tos --server letsencrypt --http --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2       || { warn "证书申请失败：80 端口需可从公网访问（被占用就停掉占用者，或改用 DNS-01）—— 降级为仅本机 HTTP"; return 1; }
   fi
 
   CRT="$(ls -1 "${TLS_DIR}"/*.crt 2>/dev/null | head -1)"
@@ -237,7 +237,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'lego run --accept-tos --server letsencrypt --profile shortlived --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2'
+ExecStart=/bin/sh -c 'lego run --accept-tos --server letsencrypt --profile shortlived --http --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2'
 EOF2
     cat > /etc/systemd/system/resi-fanout-acme.timer <<EOF2
 [Unit]
@@ -561,7 +561,7 @@ cat <<EOF
 
 ============================================================
  ${APP} installed
-  API/UI : ${TLS_ENABLED:+https}${PUBLIC_IP:+://}${PUBLIC_IP:-127.0.0.1}:${API_PORT}${BASE_PATH:-}  (web root: ${PREFIX}/web)
+  API/UI : ${TLS_ENABLED:-http://}${PUBLIC_IP:-127.0.0.1}:${API_PORT}${BASE_PATH:-}  (web root: ${PREFIX}/web)
   API key: ${API_KEY_NOW:-<empty>}
   config : ${CONF_DIR}/config.json
   data   : ${DATA_DIR}
@@ -573,7 +573,7 @@ cat <<EOF
   1. open the UI (port-forward via ssh -L ${API_PORT}:127.0.0.1:${API_PORT})
   2. wait for the first fetch+check cycle (~1-3 min), check 总览
   3. integrate with 3x-ui:
-     bash ${SRC_DIR}/scripts/3xui-push.sh \\
+     bash ${PREFIX}/scripts/3xui-push.sh \\
         --api http://127.0.0.1:${API_PORT} --key <API_KEY>
      or use the UI tab 接入 3x-ui → generate outbounds and paste them
      into the panel's Xray config.
