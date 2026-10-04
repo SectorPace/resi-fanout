@@ -453,7 +453,6 @@ if host.startswith(("10.", "192.168.", "172.")):
 print(f"  若打不开：检查云安全组/防火墙是否放行 {port} 端口")
 PY
 }
-}
 
 status_panel() {
   if c systemctl && systemctl is-active --quiet "$SVC" 2>/dev/null; then
@@ -543,7 +542,11 @@ except Exception: print("unknown")' ;;
   *) sed -n '3,10p' "$0" ;;
 esac
 RFEOF
-chmod +x /usr/local/bin/rf
+if bash -n /usr/local/bin/rf 2>/dev/null; then
+  chmod +x /usr/local/bin/rf
+else
+  warn "rf 脚本语法自检失败，已保留但未授权执行（可手动查看 /usr/local/bin/rf）"
+fi
 
 log "writing systemd unit ${SERVICE}"
 # VPN Gate / WARP tunnels need NET_ADMIN (openvpn is installed by default)
