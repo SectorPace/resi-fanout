@@ -209,15 +209,29 @@ try_issue_cert() {
     lego run --accept-tos --server letsencrypt --http --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2       || { warn "证书申请失败：80 端口需可从公网访问（被占用就停掉占用者，或改用 DNS-01）—— 降级为仅本机 HTTP"; return 1; }
   fi
 
-  CRT="$(ls -1 "${TLS_DIR}"/*.crt 2>/dev/null | head -1)"
-  KEY="$(ls -1 "${TLS_DIR}"/*.key 2>/dev/null | head -1)"
+  # lego 各版本落盘位置不同（v4 顶层 <ip>.crt/<ip>.key，v5 可能带子目录
+  # 或只输出合并的 .pem），所以递归查找并按内容校验
+  CRT=""
+  KEY=""
+  for f in $(find "${TLS_DIR}" -type f \( -name '*.crt' -o -name '*.pem' \) 2>/dev/null); do
+    if grep -q "BEGIN CERTIFICATE" "$f" 2>/dev/null; then CRT="$f"; break; fi
+  done
+  for f in $(find "${TLS_DIR}" -type f -name '*.key' 2>/dev/null); do
+    if grep -q "PRIVATE KEY" "$f" 2>/dev/null; then KEY="$f"; break; fi
+  done
+  if [ -n "${CRT}" ] && [ -z "${KEY}" ] && command -v openssl >/dev/null 2>&1; then
+    # 只有合并 pem：从里面拆出私钥
+    openssl pkey -in "${CRT}" -out "${TLS_DIR}/privkey.pem" >/dev/null 2>&1 || true
+    [ -s "${TLS_DIR}/privkey.pem" ] && KEY="${TLS_DIR}/privkey.pem"
+  fi
   if [ -z "${CRT}" ] || [ -z "${KEY}" ]; then
-    warn "未在 ${TLS_DIR} 找到签发出来的证书 —— 降级为仅本机 HTTP"
+    warn "未在 ${TLS_DIR} 找到可用的证书/私钥（lego 输出: $(ls -R "${TLS_DIR}" 2>/dev/null | tr '\n' ' ' | cut -c1-160)）—— 降级为仅本机 HTTP"
     return 1
   fi
   cp -f "${CRT}" "${TLS_DIR}/fullchain.pem"
   cp -f "${KEY}" "${TLS_DIR}/privkey.pem"
   chmod 600 "${TLS_DIR}/privkey.pem"
+  green "证书就绪：${CRT##*/} + ${KEY##*/}"
   return 0
 }
 
