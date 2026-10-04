@@ -456,6 +456,12 @@ chmod 750 "${CONF_DIR}" 2>/dev/null || true
 
 # TLS 证书要等 config.json 存在之后才能写进去
 if [ "${WITH_TLS}" = "1" ]; then
+  # 已有 base_path 就复用，避免每次重装都换路径导致旧链接失效
+  EXISTING_BASE="$(python3 -c "import json;print(json.load(open('${CONF_DIR}/config.json')).get('server',{}).get('base_path',''))" 2>/dev/null || true)"
+  if [ -n "${EXISTING_BASE}" ]; then
+    BASE_PATH="${EXISTING_BASE}"
+    log "沿用现有访问路径: ${BASE_PATH}"
+  fi
   python3 - "${CONF_DIR}/config.json" "${TLS_DIR}/fullchain.pem" "${TLS_DIR}/privkey.pem" "${BASE_PATH}" "${API_PORT}" <<'PYEOF2'
 import json, sys
 cfg_path, cert, key, base, port = sys.argv[1:6]

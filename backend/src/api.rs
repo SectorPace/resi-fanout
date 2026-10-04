@@ -69,6 +69,18 @@ pub fn router(state: Arc<AppState>, web_root: &str, base_path: &str) -> Router {
     }
 
     let mut app = Router::new().nest(&format!("{base}/api"), api);
+    // 直接访问 /xxx（不带尾斜杠）时重定向到 /xxx/，
+    // 否则 /xxx 与 /xxx/ 都匹配不到路由 → 404
+    app = app.route(
+        &base,
+        get({
+            let base = base.clone();
+            move || {
+                let base = base.clone();
+                async move { axum::response::Redirect::temporary(&format!("{base}/")) }
+            }
+        }),
+    );
 
     // Under a base path the static files are served by our own routes:
     // nest()'s catch-all does not match an empty remainder (so `/<base>/`
