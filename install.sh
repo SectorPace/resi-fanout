@@ -198,13 +198,15 @@ try_issue_cert() {
   fi
 
   mkdir -p "${TLS_DIR}"
-  ACME_ARGS="--server https://acme-v02.api.letsencrypt.org/directory --accept-tos --path ${TLS_DIR} --domains ${PUBLIC_IP} run"
+  # lego v5：旗标放在 run 子命令之后；--server 支持 letsencrypt 短代码；
+  # run 兼具续期（--renew-days 默认按证书生命周期的 1/3 自动判断）
+  ACME_ARGS="--accept-tos --server letsencrypt --profile shortlived --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2"
   [ -n "${ACME_EMAIL:-}" ] && ACME_ARGS="--email ${ACME_EMAIL} ${ACME_ARGS}"
 
   log "为 ${PUBLIC_IP} 申请证书（HTTP-01 需要 80 端口可从公网访问）"
-  if ! lego ${ACME_ARGS} --profile shortlived; then
+  if ! lego run ${ACME_ARGS}; then
     warn "shortlived profile 申请失败，改用默认 profile 重试"
-    lego ${ACME_ARGS} || { warn "证书申请失败：80 端口需可从公网访问（被占用就停掉占用者，或改用 DNS-01）—— 降级为仅本机 HTTP"; return 1; }
+    lego run --accept-tos --server letsencrypt --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2       || { warn "证书申请失败：80 端口需可从公网访问（被占用就停掉占用者，或改用 DNS-01）—— 降级为仅本机 HTTP"; return 1; }
   fi
 
   CRT="$(ls -1 "${TLS_DIR}"/*.crt 2>/dev/null | head -1)"
@@ -235,7 +237,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'lego --server https://acme-v02.api.letsencrypt.org/directory --accept-tos --path ${TLS_DIR} --domains ${PUBLIC_IP} run && cp -f ${TLS_DIR}/*.crt ${TLS_DIR}/fullchain.pem && cp -f ${TLS_DIR}/*.key ${TLS_DIR}/privkey.pem'
+ExecStart=/bin/sh -c 'lego run --accept-tos --server letsencrypt --profile shortlived --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2'
 EOF2
     cat > /etc/systemd/system/resi-fanout-acme.timer <<EOF2
 [Unit]
