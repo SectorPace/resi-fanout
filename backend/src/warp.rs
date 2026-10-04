@@ -212,8 +212,15 @@ pub async fn register(state: &Arc<AppState>, license: Option<String>) -> Result<
             Some(cfg.warp.license.clone())
         }
     });
+    // systemd 以专用用户运行且 ProtectHome=true，默认 $HOME 不可写，
+    // 显式把 HOME 指到数据目录，wgcf 才能写 ~/.wgcf
+    let home_dir = std::path::Path::new(&cfg.warp.conf_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("/var/lib/resi-fanout/warp"));
+    let _ = tokio::fs::create_dir_all(&home_dir).await;
     let mut cmd = Command::new("wgcf");
-    cmd.arg("register");
+    cmd.env("HOME", &home_dir).arg("register");
     if let Some(l) = &lic {
         cmd.arg("--license").arg(l);
     }
@@ -230,8 +237,7 @@ pub async fn register(state: &Arc<AppState>, license: Option<String>) -> Result<
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-    let src = PathBuf::from(home).join(".wgcf/wgcf-profile.conf");
+    let src = home_dir.join(".wgcf/wgcf-profile.conf");
     let text = tokio::fs::read_to_string(&src)
         .await
         .map_err(|e| format!("profile not found after wgcf: {e}"))?;

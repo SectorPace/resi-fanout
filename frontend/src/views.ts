@@ -670,30 +670,38 @@ export async function renderConfig(root: HTMLElement): Promise<void> {
             class: "primary",
             onclick: async () => {
               try {
+                // 基于服务端当前配置做增量覆盖：只改表单里出现的字段，
+                // 绝不能丢掉 base_path / tls / warp / xui 等未暴露的段
+                // （丢掉会把公网 HTTPS + 随机路径降级成明文 HTTP）
                 const next: Config = {
+                  ...cfg,
                   server: {
+                    ...cfg.server,
                     listen: get("c-listen"),
                     api_key: get("c-apikey"),
                     web_root: get("c-web")
                   },
                   fanout: {
+                    ...cfg.fanout,
                     bind: get("c-bind"),
                     base_port: getn("c-base"),
                     mode: (document.getElementById("c-mode") as HTMLSelectElement).value,
                     max_ports: getn("c-max")
                   },
                   checker: {
+                    ...cfg.checker,
                     timeout_secs: getn("c-timeout"),
                     concurrency: getn("c-conc"),
-                    max_pool: getn("c-pool"),
-                    classify_url: cfg.checker.classify_url
+                    max_pool: getn("c-pool")
                   },
                   scheduler: {
+                    ...cfg.scheduler,
                     refresh_minutes: getn("c-refresh"),
                     recheck_minutes: getn("c-recheck"),
                     prune_days: getn("c-prune")
                   },
                   filter: {
+                    ...cfg.filter,
                     only_residential: (document.getElementById("c-resi") as HTMLInputElement).checked,
                     countries: get("c-countries")
                       ? get("c-countries").split(",").map((s) => s.trim()).filter(Boolean)
@@ -703,6 +711,7 @@ export async function renderConfig(root: HTMLElement): Promise<void> {
                       : []
                   },
                   vpngate: {
+                    ...cfg.vpngate,
                     enabled: (document.getElementById("c-vg-enabled") as HTMLInputElement).checked,
                     base_port: getn("c-vg-base"),
                     max_servers: getn("c-vg-max"),
@@ -710,12 +719,8 @@ export async function renderConfig(root: HTMLElement): Promise<void> {
                       ? get("c-vg-countries").split(",").map((s) => s.trim()).filter(Boolean)
                       : [],
                     min_speed_mbps: getn("c-vg-speed"),
-                    openvpn_bin: get("c-vg-bin"),
-                    only_residential: (document.getElementById("c-vg-resi") as HTMLInputElement).checked,
-                    api_url: cfg.vpngate.api_url,
-                    scripts_dir: cfg.vpngate.scripts_dir
-                  },
-                  sources: JSON.parse((document.getElementById("c-sources") as HTMLTextAreaElement).value)
+                    only_residential: (document.getElementById("c-vg-resi") as HTMLInputElement).checked
+                  }
                 };
                 await api.saveConfig(next);
                 toast("配置已保存并生效");

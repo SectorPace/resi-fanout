@@ -14,7 +14,8 @@ TABLE="${WARP_TABLE:-22000}"
 LOCAL="${ifconfig_local:-}"
 DEV="${dev:-}"
 # wg-quick exports `address` (may be a comma separated CIDR list)
-[ -z "${LOCAL}" ] && LOCAL="${address%%,*}"
+[ -z "${LOCAL}" ] && LOCAL="${address:-}"
+[ -z "${LOCAL}" ] && LOCAL="$(ip -4 -o addr show dev "${INTERFACE:-${dev}}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)"
 LOCAL="${LOCAL%%/*}"
 
 [ -n "${LOCAL}" ] && [ -n "${DEV}" ] || exit 0

@@ -16,6 +16,10 @@ PREFIX="/opt/${APP}"
 CONF_DIR="/etc/${APP}"
 DATA_DIR="/var/lib/${APP}"
 SERVICE="${APP}.service"
+
+TMPROOT="$(mktemp -d)"
+cleanup() { [ -n "${TMPROOT:-}" ] && rm -rf "$TMPROOT"; }
+trap cleanup EXIT INT TERM
 API_PORT="7654"
 WITH_3XUI="0"
 WITH_VPNGATE="0"
@@ -133,9 +137,11 @@ if [ "${WITH_WARP}" = "1" ]; then
       aarch64|arm64) WGURL="https://github.com/ViRb3/wgcf/releases/latest/download/wgcf_2.2.22_linux_arm64" ;;
       *)             WGURL="" ;;
     esac
-    if [ -n "${WGURL}" ] && curl -fsSL "${WGURL}" -o /usr/local/bin/wgcf; then
-      chmod +x /usr/local/bin/wgcf
+    TMPB="${TMPROOT}/wgcf.bin"
+    if [ -n "${WGURL}" ] && curl -fsSL "${WGURL}" -o "${TMPB}" && [ -s "${TMPB}" ]; then
+      install -m 755 "${TMPB}" /usr/local/bin/wgcf
     else
+      rm -f /usr/local/bin/wgcf
       warn "wgcf download skipped — you can still paste a WireGuard config in the UI"
     fi
   fi
@@ -161,9 +167,11 @@ if [ "${WITH_MASQUE}" = "1" ]; then
     aarch64|arm64) MURL="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-arm64-v1.19.12.gz" ;;
     *)             MURL="" ;;
   esac
-  if [ -n "${MURL}" ] && curl -fsSL "${MURL}" | gzip -dc > /usr/local/bin/mihomo 2>/dev/null; then
-    chmod +x /usr/local/bin/mihomo
+  TMPB="${TMPROOT}/mihomo.bin"
+  if [ -n "${MURL}" ] && curl -fsSL "${MURL}" | gzip -dc > "${TMPB}" 2>/dev/null && [ -s "${TMPB}" ]; then
+    install -m 755 "${TMPB}" /usr/local/bin/mihomo
   else
+    rm -f /usr/local/bin/mihomo
     warn "mihomo download failed — MASQUE nodes can still be imported, just run mihomo manually"
   fi
 fi
@@ -188,7 +196,7 @@ try_issue_cert() {
       aarch64|arm64) LEGO_URL="https://github.com/go-acme/lego/releases/download/v5.5.2/lego_v5.5.2_linux_arm64.tar.gz" ;;
       *) warn "该架构没有 lego 预编译包"; return 1 ;;
     esac
-    T="$(mktemp -d)"
+    T="${TMPROOT}/lego"; mkdir -p "$T"
     if curl -fsSL "${LEGO_URL}" | tar xz -C "${T}" && [ -f "${T}/lego" ]; then
       install -m 755 "${T}/lego" /usr/local/bin/lego
     else
@@ -383,6 +391,7 @@ json.dump(c, open(p, "w"), indent=2, ensure_ascii=False)
 PYEOF
   fi
   chmod 640 "${CONF_DIR}/config.json"
+  chown root:"${APP}" "${CONF_DIR}/config.json" 2>/dev/null || true
   log "wrote ${CONF_DIR}/config.json (API key: ${API_KEY})"
 else
   API_KEY="$(python3 -c "import json;print(json.load(open('${CONF_DIR}/config.json'))['server']['api_key'])" 2>/dev/null || true)"
@@ -429,14 +438,16 @@ c() { command -v "$1" >/dev/null 2>&1; }
 api() {
   c python3 || { echo "需要 python3"; return 1; }
   python3 - "$CONF" "${1:-/api/status}" <<'PY'
-import json, sys, urllib.request
+import json, sys, ssl, urllib.request
 cfg = json.load(open(sys.argv[1]))
 host, _, port = cfg["server"]["listen"].rpartition(":")
 key = cfg["server"]["api_key"]
+scheme = "https" if cfg["server"].get("tls", {}).get("enabled") else "http"
 req = urllib.request.Request(
-    f"http://127.0.0.1:{port}{sys.argv[2]}",
+    f"{scheme}://127.0.0.1:{port}{sys.argv[2]}",
     headers={"Authorization": f"Bearer {key}"} if key else {})
-print(urllib.request.urlopen(req, timeout=15).read().decode())
+ctx = ssl.create_default_context() if scheme == "https" else None
+print(urllib.request.urlopen(req, timeout=15, context=ctx).read().decode())
 PY
 }
 

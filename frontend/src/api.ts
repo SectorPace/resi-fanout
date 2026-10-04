@@ -113,8 +113,15 @@ export interface XuiInfo {
   error?: string;
 }
 
+export interface TlsCfg {
+  enabled: boolean;
+  cert_path: string;
+  key_path: string;
+  reload_secs: number;
+}
+
 export interface Config {
-  server: { listen: string; api_key: string; web_root: string };
+  server: { listen: string; api_key: string; web_root: string; base_path: string; tls: TlsCfg };
   fanout: { bind: string; base_port: number; mode: string; max_ports: number };
   checker: {
     timeout_secs: number;
