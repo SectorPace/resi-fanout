@@ -23,6 +23,7 @@ import argparse
 import base64
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -190,8 +191,10 @@ def merge_template(conn, entries, outbound_prefix, inbound_prefix, fanout_bind):
     made_outbounds, made_rules = [], []
     for e in entries:
         fanout_port = e.get("fanout_port", e.get("port"))
-        out_tag = f"{outbound_prefix}-{fanout_port}"
-        in_tag = f"{inbound_prefix}{fanout_port}"
+        # 用 plan 里的实际 tag：do_link 可能为避免重名给入站加了后缀，
+        # 若在这里重算 tag，路由规则就会指向一个不存在的入站（静默直连）
+        out_tag = e.get("outbound_tag") or f"{outbound_prefix}-{fanout_port}"
+        in_tag = e.get("inbound_tag") or f"{inbound_prefix}{fanout_port}"
         ob = {
             "tag": out_tag,
             "protocol": "socks",
@@ -224,7 +227,7 @@ def do_link(args):
     entries = json.loads(args.entries)
     if not entries:
         die("no entries")
-    conn = sqlite3.connect(args.db)
+    conn = sqlite3.connect(args.db, timeout=30)
     conn.row_factory = sqlite3.Row
     template = load_template(conn, args.template_id)
     cols = columns(conn, "inbounds")
@@ -269,7 +272,12 @@ def do_link(args):
         return ok(plan=plan, template=template.get("remark") or template.get("tag"))
 
     backup = f"{args.db}.bak.{time.strftime('%Y%m%d%H%M%S')}"
-    shutil.copy2(args.db, backup)
+    # 面板运行中可能处于 WAL 模式，直接 cp 主库会漏掉 -wal 里的数据；
+    # VACUUM INTO 导出的是一致快照
+    try:
+        conn.execute("VACUUM INTO ?", (backup,))
+    except sqlite3.Error:
+        shutil.copy2(args.db, backup)
 
     created = []
     try:
@@ -333,55 +341,79 @@ def do_link(args):
 
 
 def do_unlink(args):
-    conn = sqlite3.connect(args.db)
+    conn = sqlite3.connect(args.db, timeout=30)
     conn.row_factory = sqlite3.Row
     cols = columns(conn, "inbounds")
     clients_tbl, client_cols = find_clients_table(conn)
     if "tag" not in cols:
         die("panel has no tag column, cannot identify managed inbounds")
 
+    # LIKE 通配符转义，避免 resi_ 之类的前缀误伤其它入站
+    pattern = (
+        args.inbound_prefix.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    ) + "%"
     rows = conn.execute(
-        "SELECT id, tag, port FROM inbounds WHERE tag LIKE ?", (args.inbound_prefix + "%",)
+        "SELECT id, tag, port FROM inbounds WHERE tag LIKE ? ESCAPE '\\'",
+        (pattern,),
     ).fetchall()
-    ids = [r["id"] for r in rows]
-    if not ids:
+    if not rows:
         conn.close()
         return ok(removed=[])
-    for i in ids:
-        if clients_tbl and "inbound_id" in client_cols:
-            conn.execute(f"DELETE FROM {clients_tbl} WHERE inbound_id=?", (i,))
-        conn.execute("DELETE FROM inbounds WHERE id=?", (i,))
 
-    key = "xrayTemplateConfig"
-    row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    # 与 do_link 一致：先备份，任何失败都不留下写坏的面板库
+    backup = f"{args.db}.bak.{time.strftime('%Y%m%d%H%M%S')}"
+    # 面板运行中可能处于 WAL 模式，直接 cp 主库会漏掉 -wal 里的数据；
+    # VACUUM INTO 导出的是一致快照
+    try:
+        conn.execute("VACUUM INTO ?", (backup,))
+    except sqlite3.Error:
+        shutil.copy2(args.db, backup)
+
     removed_tags = [r["tag"] for r in rows]
-    # inbound tag resi-in-21000 pairs with outbound tag resi-21000
-    removed_out_tags = [
-        f"{args.outbound_prefix}-{t[len(args.inbound_prefix):]}"
-        for t in removed_tags
-        if t.startswith(args.inbound_prefix)
-    ]
-    gone = set(removed_tags) | set(removed_out_tags)
-    if row and str(row[0]).strip():
-        tpl = json.loads(row[0])
-        tpl["outbounds"] = [
-            o for o in tpl.get("outbounds", []) if o.get("tag") not in gone
-        ]
+    ids = [r["id"] for r in rows]
+    try:
+        for i in ids:
+            if clients_tbl and "inbound_id" in client_cols:
+                conn.execute(f"DELETE FROM {clients_tbl} WHERE inbound_id=?", (i,))
+            conn.execute("DELETE FROM inbounds WHERE id=?", (i,))
 
-        def keep_rule(r):
-            tags = r.get("inboundTag")
-            tags = set(tags) if isinstance(tags, list) else ({tags} if tags else set())
-            return not (tags & gone) and r.get("outboundTag") not in gone
+        key = "xrayTemplateConfig"
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if row and str(row[0]).strip():
+            tpl = json.loads(row[0])
+            # 我们创建的出站 tag 形如 resi-20000（纯数字端口），
+            # 入站 tag 可能带去重后缀(resi-in-20000x)，所以按数字端口匹配出站
+            port_of = {
+                int(m.group(1))
+                for t in removed_tags
+                for m in [re.fullmatch(re.escape(args.inbound_prefix) + r"(\d+)x*", t)]
+                if m
+            }
+            gone_out = {f"{args.outbound_prefix}-{p}" for p in port_of}
+            tpl["outbounds"] = [
+                o for o in tpl.get("outbounds", []) if o.get("tag") not in gone_out
+            ]
 
-        tpl.setdefault("routing", {})["rules"] = [
-            r for r in tpl.get("routing", {}).get("rules", []) if keep_rule(r)
-        ]
-        conn.execute(
-            "UPDATE settings SET value=? WHERE key=?", (json.dumps(tpl, ensure_ascii=False), key)
-        )
-    conn.commit()
+            def keep_rule(r):
+                tags = r.get("inboundTag")
+                tags = set(tags) if isinstance(tags, list) else ({tags} if tags else set())
+                return not (tags & set(removed_tags)) and r.get("outboundTag") not in gone_out
+
+            tpl.setdefault("routing", {})["rules"] = [
+                r for r in tpl.get("routing", {}).get("rules", []) if keep_rule(r)
+            ]
+            conn.execute(
+                "UPDATE settings SET value=? WHERE key=?", (json.dumps(tpl, ensure_ascii=False), key)
+            )
+        conn.commit()
+    except Exception as exc:  # noqa: BLE001
+        conn.rollback()
+        conn.close()
+        die(f"解绑失败（面板库已回滚，备份在 {backup}）：{exc}")
     conn.close()
-    ok(removed=[{"id": r["id"], "tag": r["tag"], "port": r["port"]} for r in rows])
+    ok(removed=[{"id": r["id"], "tag": r["tag"], "port": r["port"]} for r in rows], backup=backup)
 
 
 def main():
@@ -402,7 +434,7 @@ def main():
         die(f"panel database not found: {args.db}")
 
     if args.cmd == "list":
-        conn = sqlite3.connect(args.db)
+        conn = sqlite3.connect(args.db, timeout=30)
         ok(**list_inbounds(conn))
         conn.close()
     elif args.cmd in ("preview", "link"):

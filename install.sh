@@ -664,7 +664,6 @@ EOF
 
 if [ "${WITH_3XUI}" = "1" ]; then
   log "pushing outbounds into local 3x-ui panel"
-  bash "${SRC_DIR}/scripts/3xui-push.sh" \
-    --api "http://127.0.0.1:${API_PORT}" \
-    --key "${API_KEY_NOW}" || warn "3x-ui push failed — run it manually later"
+  RF_KEY="${API_KEY_NOW}" bash "${SRC_DIR}/scripts/3xui-push.sh" \
+    || warn "3x-ui push failed — run it manually later"
 fi

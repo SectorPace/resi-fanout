@@ -22,7 +22,7 @@ export function renderProxies(root: HTMLElement): void {
         {
           onchange: (e) => {
             proxyState.alive = (e.target as HTMLSelectElement).value;
-            void reload();
+            void reload(true);
           }
         },
         el("option", { value: "1" }, "仅存活"),
@@ -32,7 +32,7 @@ export function renderProxies(root: HTMLElement): void {
       el("select", {
         onchange: (e) => {
           proxyState.proto = (e.target as HTMLSelectElement).value;
-          void reload();
+          void reload(true);
         }
       },
         el("option", { value: "" }, "全部协议"),
@@ -46,7 +46,7 @@ export function renderProxies(root: HTMLElement): void {
         value: proxyState.country,
         onchange: (e) => {
           proxyState.country = (e.target as HTMLInputElement).value.trim();
-          void reload();
+          void reload(true);
         }
       }),
       el("input", {
@@ -55,7 +55,7 @@ export function renderProxies(root: HTMLElement): void {
         value: proxyState.q,
         onchange: (e) => {
           proxyState.q = (e.target as HTMLInputElement).value.trim();
-          void reload();
+          void reload(true);
         }
       }),
       el("label", { class: "chk" },
@@ -88,9 +88,11 @@ export function renderProxies(root: HTMLElement): void {
     await reload();
   }
 
-  async function reload(): Promise<void> {
+  async function reload(resetPaging = false): Promise<void> {
     const box = document.getElementById("proxy-table");
     if (!box) return;
+    // 换筛选条件时回到第一页，否则会停在旧 offset 上看到空表
+    if (resetPaging) proxyState.offset = 0;
     const params = new URLSearchParams({
       limit: String(PAGE_SIZE),
       offset: String(proxyState.offset)
@@ -103,7 +105,11 @@ export function renderProxies(root: HTMLElement): void {
     try {
       const { total, items } = await api.proxies(params.toString());
       const info = document.getElementById("pg-info");
-      if (info) info.textContent = `第 ${proxyState.offset + 1}-${proxyState.offset + items.length} 条 / 共 ${total}`;
+      if (info) {
+        info.textContent = items.length
+          ? `第 ${proxyState.offset + 1}-${proxyState.offset + items.length} 条 / 共 ${total}`
+          : `共 ${total} 条`;
+      }
       box.replaceChildren(
         el(
           "table",
@@ -514,10 +520,28 @@ export function renderWarp(root: HTMLElement): void {
     }
     const tb = document.getElementById("warp-tunnels");
     if (!tb) return;
+    // VPN Gate 页也在拉同一份 /api/vpngate，这里降频到 ~60s 避免重复请求
+    warpTick += 1;
+    if (warpTick % 4 !== 0 && warpRows.length) {
+      renderWarpTunnels(warpRows);
+      return;
+    }
     try {
       const vg = await api.vpngate();
-      const rows = vg.tunnels.filter((t) => t.server_key === "warp" || t.server_key === "masque");
-      tb.replaceChildren(
+      warpRows = vg.tunnels.filter((t) => t.server_key === "warp" || t.server_key === "masque");
+      renderWarpTunnels(warpRows);
+    } catch {
+      // vpngate 接口失败不影响 WARP 状态显示
+    }
+  }
+
+  let warpTick = 0;
+  let warpRows: import("./api").VpnTunnel[] = [];
+
+  function renderWarpTunnels(rows: import("./api").VpnTunnel[]): void {
+    const tb = document.getElementById("warp-tunnels");
+    if (!tb) return;
+    tb.replaceChildren(
         el(
           "table",
           { class: "tbl" },
@@ -543,9 +567,6 @@ export function renderWarp(root: HTMLElement): void {
           )
         )
       );
-    } catch {
-      // vpngate 接口失败不影响 WARP 状态显示
-    }
   }
   void loadWarp();
   const warpTimer = window.setInterval(() => void loadWarp(), 15000);

@@ -29,8 +29,9 @@
 
 set -euo pipefail
 
-API="http://127.0.0.1:7654"
-KEY=""
+RF_CONF="${RF_CONF:-/etc/resi-fanout/config.json}"
+API=""            # 为空时从 resi-fanout 配置自动推导
+KEY="${RF_KEY:-}" # 用环境变量传入，避免出现在 ps 输出里
 PORTS=""
 RESIDENTIAL="0"
 PREFIX="resi"
@@ -69,9 +70,25 @@ done
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 command -v curl >/dev/null 2>&1 || die "curl is required"
 
+# ------------------------------------------------- auto-detect API endpoint/key
+if [ -z "${API}" ] && [ -f "${RF_CONF}" ]; then
+  eval "$(python3 - "${RF_CONF}" <<'PYEOF2'
+import json, shlex, sys
+cfg = json.load(open(sys.argv[1]))["server"]
+host, _, port = cfg["listen"].rpartition(":")
+scheme = "https" if cfg.get("tls", {}).get("enabled") else "http"
+base = cfg.get("base_path", "").rstrip("/")
+print(f'API="${{1:-{shlex.quote(scheme + "://127.0.0.1:" + port + base)}}}"')
+print(f'KEY="${{RF_KEY:-{shlex.quote(cfg.get("api_key", ""))}}}"')
+PYEOF2
+)"
+  log "自动读取到 API: ${API}"
+fi
+[ -n "${API}" ] || API="http://127.0.0.1:7654"
+
 # ---------------------------------------------------------------- fetch snippet
-Q="prefix=${PREFIX}"
-[ -n "${PORTS}" ] && Q="${Q}&ports=${PORTS}"
+Q="prefix=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "${PREFIX}")"
+[ -n "${PORTS}" ] && Q="${Q}&ports=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "${PORTS}")"
 [ "${RESIDENTIAL}" = "1" ] && Q="${Q}&residential=1"
 
 TMP="$(mktemp -t resi-fanout-snippet.XXXXXX.json)"
@@ -130,7 +147,11 @@ print(json.dumps(out))')"
   fi
   if [ "${RESTART}" = "1" ]; then
     log "restarting x-ui"
-    command -v x-ui >/dev/null 2>&1 && x-ui restart >/dev/null 2>&1 || systemctl restart x-ui || true
+    if command -v x-ui >/dev/null 2>&1; then
+      x-ui restart >/dev/null 2>&1 || systemctl restart x-ui || die "面板重启失败：配置已写入数据库但 x-ui 未重启，请手动执行 systemctl restart x-ui"
+    else
+      systemctl restart x-ui || die "面板重启失败：配置已写入数据库但 x-ui 未重启，请手动执行 systemctl restart x-ui"
+    fi
   fi
   log "done"
   exit 0
@@ -200,9 +221,9 @@ PYEOF
 if [ "${RESTART}" = "1" ]; then
   log "restarting x-ui"
   if command -v x-ui >/dev/null 2>&1; then
-    x-ui restart >/dev/null 2>&1 || systemctl restart x-ui || true
+    x-ui restart >/dev/null 2>&1 || systemctl restart x-ui || die "面板重启失败，请手动执行 systemctl restart x-ui"
   else
-    systemctl restart x-ui || true
+    systemctl restart x-ui || die "面板重启失败，请手动执行 systemctl restart x-ui"
   fi
   log "done. check the panel: Xray 配置 → outbounds 里应出现 ${PREFIX}-<port> 出站"
 else

@@ -153,8 +153,14 @@ const KEY_STORE = "resi_fanout_api_key";
  * actually lives, otherwise every request would hit the root and 404.
  */
 const BASE_PATH = (() => {
-  const p = location.pathname.replace(/\/+$/, "");
-  return p === "" ? "" : p;
+  let p = location.pathname.replace(/\/+$/, "");
+  // 页面可能是 /<base>/index.html 或直接 /index.html 打开的，
+  // 末段带 "." 就是文件名，不能算进 API 前缀，否则请求全 404
+  const last = p.split("/").pop() ?? "";
+  if (last.includes(".")) {
+    p = p.slice(0, p.lastIndexOf("/"));
+  }
+  return p === "/" ? "" : p;
 })();
 
 const url = (path: string): string => `${BASE_PATH}${path}`;
