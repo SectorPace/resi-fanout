@@ -81,10 +81,21 @@ elif [ "${FROM_SOURCE}" != "1" ]; then
     aarch64|arm64)   TGT="aarch64-unknown-linux-gnu" ;;
     *)               TGT="" ;;
   esac
-  TMP="$(mktemp -d)"
-  if [ -n "${TGT}" ] && curl -fsSL "https://github.com/${GH_REPO}/releases/latest/download/resi-fanout-${TGT}.tar.gz" -o "${TMP}/app.tar.gz" 2>/dev/null; then
+  TMP="${TMPROOT}/dl"; mkdir -p "$TMP"
+  REL_URL="https://github.com/${GH_REPO}/releases/latest/download"
+  if [ -n "${TGT}" ] && curl -fsSL "${REL_URL}/resi-fanout-${TGT}.tar.gz" -o "${TMP}/app.tar.gz" 2>/dev/null; then
+    # 供应链防护：先校验 sha256 再执行解压物
+    if curl -fsSL "${REL_URL}/SHA256SUMS" -o "${TMP}/SHA256SUMS" 2>/dev/null; then
+      if (cd "$TMP" && grep "resi-fanout-${TGT}.tar.gz" SHA256SUMS | sha256sum -c - >/dev/null 2>&1); then
+        green "sha256 校验通过"
+      else
+        die "预编译包 sha256 校验失败（可能下载损坏或被篡改），已中止安装"
+      fi
+    else
+      warn "未能获取 SHA256SUMS，跳过完整性校验"
+    fi
     log "downloaded prebuilt release for ${TGT} — installing (no toolchain needed)"
-    tar xzf "${TMP}/app.tar.gz" -C "${TMP}"
+    tar xzf "${TMP}/app.tar.gz" -C "$TMP"
     SRC_DIR="${TMP}/resi-fanout-${TGT}"
     PREBUILT="1"
   else
@@ -209,11 +220,12 @@ try_issue_cert() {
   mkdir -p "${TLS_DIR}"
   # lego v5：旗标放在 run 子命令之后；--server 支持 letsencrypt 短代码；
   # run 兼具续期（--renew-days 默认按证书生命周期的 1/3 自动判断）
-  ACME_ARGS="--accept-tos --server letsencrypt --profile shortlived --http --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2"
-  [ -n "${ACME_EMAIL:-}" ] && ACME_ARGS="--email ${ACME_EMAIL} ${ACME_ARGS}"
+  ACME_ARGS=(--accept-tos --server letsencrypt --profile shortlived --http
+             --path "${TLS_DIR}" --domains "${PUBLIC_IP}" --renew-days 2)
+  [ -n "${ACME_EMAIL:-}" ] && ACME_ARGS=(--email "${ACME_EMAIL}" "${ACME_ARGS[@]}")
 
   log "为 ${PUBLIC_IP} 申请证书（HTTP-01 需要 80 端口可从公网访问）"
-  if ! lego run ${ACME_ARGS}; then
+  if ! lego run "${ACME_ARGS[@]}"; then
     warn "shortlived profile 申请失败，改用默认 profile 重试"
     lego run --accept-tos --server letsencrypt --http --path ${TLS_DIR} --domains ${PUBLIC_IP} --renew-days 2       || { warn "证书申请失败：80 端口需可从公网访问（被占用就停掉占用者，或改用 DNS-01）—— 降级为仅本机 HTTP"; return 1; }
   fi
@@ -392,13 +404,19 @@ PYEOF
   fi
   chmod 640 "${CONF_DIR}/config.json"
   chown root:"${APP}" "${CONF_DIR}/config.json" 2>/dev/null || true
-  log "wrote ${CONF_DIR}/config.json (API key: ${API_KEY})"
+  log "wrote ${CONF_DIR}/config.json (API Key 可用 \`rf key\` 查看)"
 else
   API_KEY="$(python3 -c "import json;print(json.load(open('${CONF_DIR}/config.json'))['server']['api_key'])" 2>/dev/null || true)"
   warn "config already exists, keeping it"
 fi
 
-id -u "${APP}" >/dev/null 2>&1 || useradd -r -M -s /usr/sbin/nologin "${APP}"
+if ! id -u "${APP}" >/dev/null 2>&1; then
+  if command -v useradd >/dev/null 2>&1; then
+    useradd -r -M -s /usr/sbin/nologin "${APP}"
+  else
+    die "本机没有 useradd，请手动创建系统用户 ${APP} 后重跑（或改用容器部署）"
+  fi
+fi
 chown -R "${APP}:${APP}" "${DATA_DIR}"
 chown    root:"${APP}"  "${CONF_DIR}" 2>/dev/null || true
 chmod 750 "${CONF_DIR}" 2>/dev/null || true
@@ -533,7 +551,12 @@ do_menu() {
       5) api /api/refresh >/dev/null 2>&1 && green "已触发抓取+检测（几分钟后看菜单统计）" || red "触发失败（服务未运行？）" ;;
       6) c journalctl && journalctl -u "$SVC" -n 50 --no-pager || yellow "需要 journalctl" ;;
       7) c journalctl && journalctl -u "$SVC" -f --no-pager || yellow "需要 journalctl" ;;
-      8) blue "UI：$(ui_url 2>/dev/null)"; blue "Key：$(python3 -c "import json;print(json.load(open('$CONF'))['server']['api_key'] or '（未设置）')" 2>/dev/null)" ;;
+      8) blue "UI：$(ui_url 2>/dev/null)"
+         MASKED="$(python3 -c "
+import json
+k = json.load(open('$CONF'))['server']['api_key']
+print((k[:4] + '****' + k[-4:]) if len(k) > 10 else ('（未设置）' if not k else '****'))" 2>/dev/null)"
+         blue "Key：${MASKED}（完整值请执行 rf key）" ;;
       9) curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash ;;
       10) readp "确认卸载？[y/N]：" yn
           [ "$yn" = "y" ] && curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/uninstall.sh | sudo bash && exit 0 ;;
@@ -642,7 +665,7 @@ cat <<EOF
 ============================================================
  ${APP} installed
   API/UI : ${TLS_ENABLED:-http://}${PUBLIC_IP:-127.0.0.1}:${API_PORT}${BASE_PATH:-}  (web root: ${PREFIX}/web)
-  API key: ${API_KEY_NOW:-<empty>}
+  API key: 见 `rf key`（不再明文打印，避免进入日志/CI 记录）
   config : ${CONF_DIR}/config.json
   data   : ${DATA_DIR}
   logs   : journalctl -u ${SERVICE} -f

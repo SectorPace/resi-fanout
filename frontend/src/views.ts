@@ -88,11 +88,14 @@ export function renderProxies(root: HTMLElement): void {
     await reload();
   }
 
+  let proxySeq = 0;
   async function reload(resetPaging = false): Promise<void> {
     const box = document.getElementById("proxy-table");
     if (!box) return;
     // 换筛选条件时回到第一页，否则会停在旧 offset 上看到空表
     if (resetPaging) proxyState.offset = 0;
+    // 请求序号：快速切换筛选时，先发的请求即使后到也不能覆盖新结果
+    const mySeq = ++proxySeq;
     const params = new URLSearchParams({
       limit: String(PAGE_SIZE),
       offset: String(proxyState.offset)
@@ -104,6 +107,7 @@ export function renderProxies(root: HTMLElement): void {
     if (proxyState.q) params.set("q", proxyState.q);
     try {
       const { total, items } = await api.proxies(params.toString());
+      if (mySeq !== proxySeq) return;
       const info = document.getElementById("pg-info");
       if (info) {
         info.textContent = items.length
@@ -259,7 +263,9 @@ export function renderVpngate(root: HTMLElement): void {
     el("div", { id: "vg-pool" })
   );
 
+  let vgSeq = 0;
   async function reload(): Promise<void> {
+    const mySeq = ++vgSeq;
     let info: VpngateInfo;
     const hint = document.getElementById("vg-hint");
     try {
@@ -269,6 +275,7 @@ export function renderVpngate(root: HTMLElement): void {
       if (t) t.replaceChildren(el("div", { class: "error" }, String(e)));
       return;
     }
+    if (mySeq !== vgSeq) return;
     if (hint) {
       const m = (info as unknown as { meta?: { source?: string; rows?: number; at?: number } }).meta;
       const src = m?.source ? ` · 源 ${m.source.split("/")[2] ?? m.source}` : "";
@@ -493,7 +500,9 @@ export function renderWarp(root: HTMLElement): void {
     }
   }
 
+  let warpSeq = 0;
   async function loadWarp(): Promise<void> {
+    const mySeq = ++warpSeq;
     const box = document.getElementById("warp-status");
     const out = document.getElementById("warp-out") as HTMLTextAreaElement | null;
     if (!box) return;
@@ -510,6 +519,7 @@ export function renderWarp(root: HTMLElement): void {
         w.exit_ip ? `出口 ${w.exit_ip} · ${w.country ?? "?"} · ${w.isp ?? "?"}${w.latency_ms != null ? ` · ${w.latency_ms}ms` : ""}` : "",
         w.error ? `错误：${w.error}` : ""
       ].filter(Boolean);
+      if (mySeq !== warpSeq) return;
       box.textContent = parts.join("  |  ");
       if (w.xray_outbound && out) {
         out.style.display = "";
