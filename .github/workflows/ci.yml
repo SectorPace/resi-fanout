@@ -3,11 +3,13 @@ name: CI
 on:
   push:
     branches: [main, 'v*']
-      # `branches:` only ever matches refs/heads/*, so the version-sync job's
-      # `startsWith(github.ref, 'refs/tags/v')` guard could not fire from a
-      # branch filter alone. A `tags:` filter is what actually triggers on a
-      # version tag push.
-      tags: ['v*']
+    # `branches:` only ever matches refs/heads/*, so the version-sync job's
+    # `startsWith(github.ref, 'refs/tags/v')` guard could not fire from a
+    # branch filter alone. A `tags:` filter is what actually triggers on a
+    # version tag push.
+    # NOTE: these keys must sit at the same indent as `branches:` — nesting the
+    # comment deeper made this file unparseable and failed every run.
+    tags: ['v*']
   pull_request:
 
 # Least privilege: this workflow only reads the repo. Previously it declared no
