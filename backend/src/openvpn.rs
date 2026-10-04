@@ -299,6 +299,10 @@ async fn reconcile(state: &Arc<AppState>, cfg: &crate::config::Config, running: 
                     }
                     None => {
                         mark(state, &t.server_key, |x| x.last_check = Some(now_ts())).await;
+                        // `dirty` is no longer set unconditionally (it used to be,
+                        // which rewrote state.json every tick), so this branch has
+                        // to flag its own mutation or the new timestamp is lost.
+                        dirty = true;
                     }
                 }
             }
@@ -334,7 +338,8 @@ async fn reconcile(state: &Arc<AppState>, cfg: &crate::config::Config, running: 
 const FORBIDDEN_DIRECTIVES: &[&str] = &[
     // run arbitrary programs
     "up", "down", "route-up", "ipchange", "client-connect", "learn-address",
-    "tls-verify", "plugin", "config", "cd", "chroot", "daemon", "askpass",
+    "tls-verify", "crl-verify", "plugin", "config", "cd", "chroot", "daemon",
+    "askpass",
     // environment / privileges / config we own
     "setenv", "setenv-safe", "script-security", "user", "group", "auth-user-pass",
     // take over host routing (we use route-nopull + `ip rule from ... table N`)
@@ -344,6 +349,29 @@ const FORBIDDEN_DIRECTIVES: &[&str] = &[
     "dev", "dev-node", "dev-type", "log", "log-append", "status", "writepid",
     "management", "management-client", "management-query-passwords",
 ];
+
+/// Inline tags whose payload is *data* rather than directives.
+///
+/// Only these switch the sanitizer into pass-through mode. The first version
+/// entered block mode for anything starting with `<`, so a malformed or
+/// unclosed `<ca` flipped the whole remainder of the file into unfiltered
+/// output — i.e. the bypass protection turned itself off.
+const INLINE_TAGS: &[&str] = &[
+    "ca", "cert", "key", "dh", "extra-certs", "tls-auth", "tls-crypt",
+    "tls-crypt-v2", "pkcs12", "http-proxy-user-pass",
+];
+
+/// If `line` is exactly `<tag>` for a known inline tag, return that tag.
+fn inline_tag_open(line: &str) -> Option<String> {
+    let t = line.trim();
+    let inner = t.strip_prefix('<')?.strip_suffix('>')?;
+    // exactly `<tag>`: no whitespace, no further angle brackets
+    if inner.is_empty() || !inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+        return None;
+    }
+    let tag = inner.to_ascii_lowercase();
+    INLINE_TAGS.contains(&tag.as_str()).then_some(tag)
+}
 
 /// The directive name of one OpenVPN config line, lowercased, or `None` for
 /// blanks/comments.
@@ -369,7 +397,10 @@ fn directive_of(line: &str) -> Option<String> {
 ///
 /// `<ca>`, `<cert>`, `<key>` and `<tls-auth>` payloads span many lines and are
 /// *not* directives, so their contents are copied through verbatim; filtering
-/// them would corrupt the tunnel material.
+/// them would corrupt the tunnel material. Block mode is entered only for a
+/// well-formed opening tag from `INLINE_TAGS`, and any closing tag ends it, so
+/// neither a malformed tag nor a stray close can disable filtering for what
+/// follows.
 fn sanitize_remote_config(base: &str, port: u16) -> String {
     let mut out = String::with_capacity(base.len());
     let mut in_block = false;
@@ -378,14 +409,18 @@ fn sanitize_remote_config(base: &str, port: u16) -> String {
         if in_block {
             out.push_str(line);
             out.push('\n');
-            if t.contains("</") {
+            // Leave block mode on ANY closing tag or a new well-formed opening
+            // tag, not just the matching one. Inline payloads are PEM/base64 and
+            // never contain a line starting with `</`, so a stray `</ca>` inside
+            // a `<key>` block must not keep filtering switched off for the rest
+            // of the file.
+            if t.starts_with("</") || inline_tag_open(line).is_some() {
                 in_block = false;
             }
             continue;
         }
         if t.starts_with('<') {
-            // opening tag (possibly with the payload on the same line)
-            in_block = !t.contains("</");
+            in_block = inline_tag_open(line).is_some();
             out.push_str(line);
             out.push('\n');
             continue;
@@ -535,4 +570,117 @@ fn next_free_port(used: &[u16], base: u16, max: usize) -> Option<u16> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PORT: u16 = 21000;
+
+    fn kept(src: &str) -> String {
+        sanitize_remote_config(src, PORT)
+    }
+
+    #[test]
+    fn drops_script_executing_directives_however_they_are_spelled() {
+        // A tab is a parameter delimiter for OpenVPN just like a space, so a
+        // literal `starts_with("up ")` check is trivially bypassed. Also cover
+        // the optional `--` prefix and casing, and `crl-verify`, whose third
+        // argument is executed as a command.
+        for line in [
+            "up /tmp/evil.sh",
+            "up\t/tmp/evil.sh",
+            "  up  /tmp/evil.sh",
+            "--up /tmp/evil.sh",
+            "UP /tmp/evil.sh",
+            "Up\t/tmp/evil.sh",
+            "down /tmp/evil.sh",
+            "route-up /tmp/evil.sh",
+            "ipchange /tmp/evil.sh",
+            "client-connect /tmp/evil.sh",
+            "tls-verify /tmp/evil.sh",
+            "crl-verify /tmp/crl.pem /tmp \"script evil\"",
+            "plugin /tmp/evil.so",
+            "iproute /tmp/evil.sh",
+            "config /tmp/other.conf",
+            "management 127.0.0.1 7505",
+        ] {
+            assert!(
+                kept(line).trim().is_empty(),
+                "directive survived sanitizing: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_the_directives_a_tunnel_needs() {
+        for line in [
+            "client",
+            "remote 1.2.3.4 443",
+            "proto udp",
+            "resolv-retry infinite",
+            "nobind",
+            "persist-key",
+            "persist-tun",
+            "cipher AES-256-CBC",
+            "data-ciphers-fallback AES-256-CBC",
+            "auth SHA1",
+            "remote-cert-tls server",
+            "verb 3",
+            "float",
+        ] {
+            assert_eq!(kept(line).trim(), line, "dropped a needed directive: {line:?}");
+        }
+    }
+
+    #[test]
+    fn comments_are_left_alone() {
+        // OpenVPN treats these as comments too, so they are not a vector, and
+        // mangling them would only confuse the operator reading the log.
+        assert_eq!(kept("# up /tmp/evil.sh").trim(), "# up /tmp/evil.sh");
+        assert_eq!(kept("; up /tmp/evil.sh").trim(), "; up /tmp/evil.sh");
+    }
+
+    #[test]
+    fn preserves_inline_blocks_verbatim() {
+        let src = "client\n<ca>\n-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n</ca>\nremote 1.2.3.4 443";
+        assert_eq!(kept(src), src);
+        // one-line form
+        let one = "client\n<ca>-----BEGIN CERTIFICATE-----</ca>\nremote 1.2.3.4 443";
+        assert_eq!(kept(one), one);
+    }
+
+    #[test]
+    fn an_unclosed_or_malformed_tag_does_not_disable_filtering() {
+        // Regression: block mode used to be entered for anything starting with
+        // '<', so `<ca` (no '>') left the rest of the file unfiltered.
+        for src in [
+            "<ca\nup /tmp/evil.sh\n</ca>",
+            "<ca\nup /tmp/evil.sh",
+            "<nope>\nup /tmp/evil.sh",
+            "<>\nup /tmp/evil.sh",
+            "<ca attr>\nup /tmp/evil.sh",
+        ] {
+            assert!(
+                !kept(src).contains("up /tmp/evil.sh"),
+                "a malformed inline tag let a directive through: {src:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wrong_close_tag_does_not_keep_filtering_off() {
+        // `</ca>` is not the close for a `<key>` block, but it must still end
+        // block mode: inline payloads never contain a line starting with `</`,
+        // so honouring only the exact tag let a stray one disable filtering.
+        let src = "<key>\nsecret\n</ca>\nup /tmp/evil.sh";
+        assert!(!kept(src).contains("up /tmp/evil.sh"));
+    }
+
+    #[test]
+    fn normalises_crlf_so_openvpn_never_sees_a_stray_carriage_return() {
+        let out = kept("client\r\nremote 1.2.3.4 443\r\n");
+        assert!(!out.contains('\r'), "CR survived: {out:?}");
+    }
 }

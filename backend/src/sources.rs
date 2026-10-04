@@ -82,6 +82,21 @@ async fn fetch_one(client: &reqwest::Client, s: &SourceCfg) -> FetchOutcome {
         "geonode" => parse_geonode(&text),
         _ => parse_text(&text, s.protocol),
     };
+    // Validate the target of EVERY entry here, once, rather than inside each
+    // parser. The JSON kinds (monosans/geonode) build `ProxyInfo` straight from
+    // the response and used to skip the check entirely, so a hostile or hijacked
+    // JSON source could hand us 127.0.0.1 / 10.x / 169.254.169.254 even though
+    // the plain-text path filtered them. Centralising it also covers any future
+    // `kind`.
+    let before = proxies.len();
+    proxies.retain(|p| valid_host(&p.ip));
+    if proxies.len() != before {
+        warn!(
+            name = %s.name,
+            dropped = before - proxies.len(),
+            "dropped entries that are not publicly routable addresses"
+        );
+    }
     // a runaway or hostile list must not be able to blow up memory
     if proxies.len() > MAX_ROWS_PER_SOURCE {
         warn!(name = %s.name, got = proxies.len(), "source row cap applied");
@@ -171,21 +186,18 @@ fn parse_line(line: &str, default_proto: Option<Protocol>) -> Option<ProxyInfo> 
 /// arbitrary client traffic to it. Without this check a hostile list (or a
 /// compromised mirror) could point entries at the host's loopback, the LAN, or
 /// a cloud metadata endpoint such as 169.254.169.254, turning the service into
-/// an SSRF pivot. Only literal IPs are judged here; a hostname is filtered at
-/// dial time by the resolved address.
+/// an SSRF pivot.
+///
+/// Only a literal, globally routable address qualifies. A *hostname* is
+/// rejected rather than resolved later: the list author chooses the name, so
+/// they also choose where it points, which is the same SSRF by another route.
 fn valid_host(h: &str) -> bool {
-    if h.is_empty() || h.len() > 253 || !h.contains('.') {
-        return false;
-    }
-    if !h
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-    {
+    if h.is_empty() || h.len() > 253 {
         return false;
     }
     match h.parse::<std::net::IpAddr>() {
         Ok(ip) => is_public_unicast(ip),
-        Err(_) => true, // hostname, not a literal address
+        Err(_) => false, // not a literal address -> not dialable by us
     }
 }
 
@@ -207,6 +219,13 @@ fn is_public_unicast(ip: std::net::IpAddr) -> bool {
                 || o[0] >= 240)                  // 240/4 reserved
         }
         IpAddr::V6(v6) => {
+            // ::ffff:a.b.c.d (IPv4-mapped) and ::a.b.c.d (IPv4-compatible) are
+            // IPv4 addresses wearing a v6 hat, so they must be judged by the v4
+            // rules — otherwise ::ffff:127.0.0.1 walks straight past the loopback
+            // check above.
+            if let Some(v4) = v6.to_ipv4_mapped().or_else(|| v6.to_ipv4()) {
+                return is_public_unicast(IpAddr::V4(v4));
+            }
             let s = v6.segments();
             !(v6.is_loopback()
                 || v6.is_unspecified()
@@ -363,4 +382,79 @@ fn parse_geonode(text: &str) -> Vec<ProxyInfo> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_public_addresses() {
+        for h in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "185.220.101.1",
+            "2606:4700:4700::1111",
+        ] {
+            assert!(valid_host(h), "rejected a public address: {h}");
+        }
+    }
+
+    #[test]
+    fn rejects_internal_and_metadata_targets() {
+        for h in [
+            "127.0.0.1",      // loopback
+            "127.1.2.3",      // whole 127/8
+            "10.0.0.5",       // rfc1918
+            "172.16.9.9",     // rfc1918
+            "192.168.1.1",    // rfc1918
+            "169.254.169.254", // cloud metadata (link-local)
+            "0.0.0.0",        // unspecified
+            "0.1.2.3",        // 0/8
+            "100.64.0.1",     // CGNAT
+            "224.0.0.1",      // multicast
+            "255.255.255.255", // broadcast
+            "192.0.2.5",      // documentation
+            "240.0.0.1",      // reserved
+            "::1",            // v6 loopback
+            "fe80::1",        // v6 link-local
+            "fc00::1",        // v6 unique-local
+            "::",             // v6 unspecified
+            "ff02::1",        // v6 multicast
+        ] {
+            assert!(!valid_host(h), "accepted an internal target: {h}");
+        }
+    }
+
+    #[test]
+    fn rejects_ipv4_addresses_disguised_as_ipv6() {
+        // These are ordinary IPv4 addresses, so the v4 rules must decide.
+        for h in ["::ffff:127.0.0.1", "::ffff:169.254.169.254", "::ffff:10.0.0.1"] {
+            assert!(!valid_host(h), "accepted a v4-mapped internal target: {h}");
+        }
+        // ...and a mapped public address is still fine
+        assert!(valid_host("::ffff:1.1.1.1"));
+    }
+
+    #[test]
+    fn rejects_hostnames_so_dns_cannot_reach_inside() {
+        // A list author who picks the name also picks where it resolves.
+        for h in [
+            "localhost",
+            "127.0.0.1.nip.io",
+            "metadata.google.internal",
+            "evil.example.com",
+            "anything.local",
+        ] {
+            assert!(!valid_host(h), "accepted a hostname: {h}");
+        }
+    }
+
+    #[test]
+    fn text_parsing_drops_internal_targets() {
+        assert!(parse_line("1.1.1.1:8080", None).is_some());
+        assert!(parse_line("socks5://127.0.0.1:1080", None).is_none());
+        assert!(parse_line("10.0.0.1:3128", None).is_none());
+        assert!(parse_line("169.254.169.254:80", None).is_none());
+    }
 }

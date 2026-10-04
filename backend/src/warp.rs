@@ -671,6 +671,11 @@ fn der_candidates(buf: &[u8]) -> Vec<[u8; 32]> {
     out
 }
 
+/// Reduce a key blob to a plain base64 32-byte key.
+///
+/// Returns `None` unless the blob yields **exactly one** 32-byte chunk: a
+/// Cloudflare multi-algorithm container (X25519 + X448) must stay untouched so
+/// it is never silently reduced to one arbitrary half.
 pub fn normalize_key(b64: &str) -> Option<String> {
     use base64::Engine as _;
     let trimmed = b64.trim();

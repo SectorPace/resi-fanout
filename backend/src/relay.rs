@@ -315,11 +315,17 @@ async fn relay_session(sock: &mut TcpStream, up: &mut TcpStream) -> Result<()> {
     }
 }
 
+/// Milliseconds since process start, from a **monotonic** clock.
+///
+/// `SystemTime` is CLOCK_REALTIME, which can jump: an NTP step backwards makes
+/// `saturating_sub` clamp to 0 so the idle timeout never fires (defeating the
+/// very fd-pinning this guards against), and a forward step of >= the timeout
+/// tears down every live relay at once. `Instant::elapsed()` cannot do either.
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    BASE.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
 }
 
 /// Records the last moment a stream moved bytes, so `relay_session` can tell an
@@ -656,4 +662,30 @@ pub(crate) async fn resolve_v4(host: &str) -> Result<std::net::Ipv4Addr> {
         }
     }
     bail!("no IPv4 address for {host}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_normal_targets() {
+        assert!(check_host("example.com").is_ok());
+        assert!(check_host("1.2.3.4").is_ok());
+        assert!(check_host("2001:db8::1").is_ok());
+        assert!(check_host(&"a".repeat(MAX_HOST_LEN)).is_ok());
+    }
+
+    #[test]
+    fn rejects_hosts_the_upstream_cannot_frame() {
+        // empty
+        assert!(check_host("").is_err());
+        // a SOCKS5 domain-length byte wraps at 256, which desynchronises the
+        // upstream proxy's framing
+        assert!(check_host(&"a".repeat(MAX_HOST_LEN + 1)).is_err());
+        // non-ascii, and anything that could inject into the HTTP CONNECT line
+        assert!(check_host("héllo.example").is_err());
+        assert!(check_host("example.com\r\nX-Injected: 1").is_err());
+        assert!(check_host("has space").is_err());
+    }
 }

@@ -8,6 +8,40 @@
 | 1.y.0 | 新功能（y+1），向后兼容 |
 | 2.0.0 | 有破坏性变更 |
 
+## v1.0.1 — 全量审查修复
+
+对全部 39 个文件做了一次完整审查并修复下列问题。均为修补版，无新增功能。
+
+### 安全
+- **openvpn：第三方配置清洗可绕过（可远程执行任意脚本）**。原实现只匹配 `"up "` 这类带空格的字面前缀，而 OpenVPN 的空格与 Tab 都是参数分隔符，`up\t/tmp/evil.sh` 可绕过；`plugin`/`config`/`setenv` 原本根本不在黑名单。改为按解析后的指令名匹配，并新增 `crl-verify`（其第三个参数会被当作命令执行）。
+- **openvpn：畸形内联标签会让清洗器自我关闭**。`<ca`（缺 `>`）曾使文件剩余部分进入透传模式。现在只有 `INLINE_TAGS` 里格式正确的开标签才进入透传，遇到任何闭标签即退出。
+- **sources：SSRF**。恶意代理源可把条目指向 `127.0.0.1`、内网或 `169.254.169.254`，把服务变成跳板。现在**所有**解析路径（含此前完全绕过校验的 monosans/geonode JSON 源）统一过滤；同时拒绝主机名（否则等同于换个途径的 SSRF）与 IPv4 映射 IPv6（`::ffff:127.0.0.1`）。
+- **config：读取失败时静默降级为默认配置**，默认 `api_key` 为空，一次 EACCES 就会让整个 `/api` 免鉴权上线，并试图用默认值覆盖用户配置。现在仅「文件不存在」才回落，写配置改为临时文件 + rename。
+- **relay：握手与中继无超时**，少量慢连接即可耗尽 fd 拖垮整个端口。
+- **warp：WireGuard 私钥与 mihomo 配置以 0644 落盘**，全机可读。
+- **tls：公网 HTTPS 监听缺少读超时**。
+- **checker：`classify_url` 配成 `https://` 时**会往 443 发明文请求，把整池判死；**HTTP 429 也不再算作「代理已死」**。
+
+### 正确性
+- **warp-up.sh / warp-down.sh：WARP 策略路由从未生效**。二者读的都是 OpenVPN 的脚本变量名（`dev`/`address`/`ifconfig_local`），wg-quick 并不导出。warp-up 因此永远在装路由前 `exit 0`（叠加 `Table = off`，扇出端口实际从未走隧道）；warp-down 则在 `set -u` 下中止，清理从不执行、持续泄漏 `ip rule`。
+- **api：TLS 证书加载失败的降级分支必然 `EADDRINUSE`**，导致证书损坏时进入 systemd 重启循环 —— 正是该分支注释声称要避免的情况。
+- **scheduler：`busy` 只在直线成功路径清零**，周期任务内任何 panic 都会让 `/api/refresh`、`/api/check` 永久 409。改由 Drop guard 释放。
+- **3xui-push.sh：空 `api_key` 时 `KEY` 变成字面量 `''`** 并仍发送 `Authorization: Bearer ''`；面板备份改用 `VACUUM INTO`（裸 `cp` 在 WAL 模式下会丢数据）。
+- **install.sh：`--no-tls` 重装不会还原 `listen`/`tls`**，服务仍监听 `0.0.0.0`，摘要行还把 HTTPS 报成 `http://`。
+- **openvpn：隧道有启动截止时间**（`resolv-retry infinite` 下不再永久占死槽位）；销毁改用 SIGTERM，`down` 钩子得以执行。
+- **relay：中继超时改用单调时钟**，避免时钟回拨使超时失效、时钟前跳同时切断所有会话。
+- **vpngate：`cert_country` 的偏移量按实际匹配到的模式计算**，「C = JP」形式（注释里写明支持）此前恒解析失败，配了国家白名单时这些节点被静默剔除。
+- **warp：`normalize_key` 真正实现「唯一候选才接受」**的多算法密钥拒绝。
+
+### 供应链
+- **install.sh：应用 tarball 校验 sha256，但 `wgcf`/`mihomo`/`lego`/`NodeSource` 四个以 root 身份装入 `/usr/local/bin` 的来源此前零校验**。新增 `fetch_verify`，有校验文件或 `*_SHA256` 环境变量时强制校验，缺失时明确告警。
+
+### 前端与 CI
+- 修复「代理源」文本框从未被保存逻辑读取导致的**静默丢数据**；复制链接硬编码 `socks5://`；已写入面板时「本地端口」列显示 inbound tag。
+- 3x-ui 直连模式的 `residential_only` 保持为 `false`（曾被误改为 `true`，会让未分类端口被静默丢弃、预览为空）。
+- CI：第三方 action 钉到完整 SHA、补 `permissions: contents: read`、shellcheck 不再 `|| true`、`version-sync` 补 `tags:` 触发、补 `timeout-minutes` 与 `concurrency`；发布改为全部架构构建成功后才创建 Release。
+- `frontend/dist` 保持入库（install.sh 在无 npm 时依赖它兜底），不加入 `.gitignore`。
+
 ## v1.0.0 — 首个正式版
 
 从 0.x 开发线一路迭代而来的首个稳定版本，包含以下完整能力：

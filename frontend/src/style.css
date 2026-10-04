@@ -304,6 +304,18 @@ button.danger:hover { background: rgba(248, 113, 113, 0.1); border-color: var(--
   margin: 10px 0;
 }
 
+/* Success notice. Only `.card.ok` / `.badge.ok` / `.toast.ok` existed, so a bare
+   `class="ok"` box rendered as unstyled flush text — the panel styling came from
+   `.error`. Mirrors `.error` so a notice keeps its box in either tone. */
+.ok {
+  background: rgba(63, 185, 111, 0.1);
+  border: 1px solid rgba(63, 185, 111, 0.45);
+  color: var(--ok);
+  border-radius: 10px;
+  padding: 11px 15px;
+  margin: 10px 0;
+}
+
 .empty {
   text-align: center;
   color: var(--dim);

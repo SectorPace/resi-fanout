@@ -6,4 +6,10 @@ data/
 state.json
 config.json
 # built by CI and release from frontend source; committed copies go stale
-frontend/dist/
+# NOTE: frontend/dist is deliberately NOT ignored. install.sh falls back to the
+# committed dist when npm is unavailable (--no-frontend, or a failed toolchain
+# install), so the built assets must stay tracked. Ignoring the directory while
+# the files remain tracked is worse than not ignoring it: vite's emptyOutDir
+# deletes the tracked assets and writes new hashed ones that the ignore rule
+# then hides, so a routine `git add -A` commits an index.html pointing at
+# assets that are absent from the repo.

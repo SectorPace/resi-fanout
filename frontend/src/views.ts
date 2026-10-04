@@ -95,7 +95,11 @@ function startPolling(fn: () => void, ms: number): void {
     window.clearInterval(timer);
     timer = 0;
   };
-  start();
+  // A document is already `hidden` when the tab is not the active one (opened
+  // in the background, middle-click, reload of a background tab), and no
+  // visibilitychange fires for the state we started in — so honour it here or
+  // the hidden tab keeps polling, which is the whole point of this helper.
+  if (!document.hidden) start();
   document.addEventListener("visibilitychange", () => {
     if (document.hidden) stop();
     else start();
@@ -844,11 +848,36 @@ export async function renderConfig(root: HTMLElement): Promise<void> {
                 if (sourcesBox) {
                   const raw = sourcesBox.value.trim();
                   const parsed: unknown = raw ? JSON.parse(raw) : [];
-                  const allObjects =
-                    Array.isArray(parsed) &&
-                    parsed.every((x) => typeof x === "object" && x !== null && !Array.isArray(x));
-                  if (!allObjects) throw new Error("代理源必须是 JSON 对象数组，请修正后重新保存");
-                  sources = parsed as Config["sources"];
+                  // Check the real field set, not just "array of objects".
+                  // SourceCfg is `#[serde(default)]` on the backend, so `{}` or
+                  // `{"url":"x"}` deserialises cleanly and gets persisted as a
+                  // source row that can never fetch anything, while `[1,2,3]`
+                  // only fails later as a raw HTTP 422 from axum's extractor.
+                  const KIND = ["text", "monosans", "geonode"];
+                  const bad = (why: string): Error => new Error(`代理源格式有误：${why}`);
+                  if (!Array.isArray(parsed)) throw bad("顶层必须是数组");
+                  const rows = parsed as unknown[];
+                  rows.forEach((x: unknown, i: number) => {
+                    const at = `第 ${i + 1} 条`;
+                    if (typeof x !== "object" || x === null || Array.isArray(x)) {
+                      throw bad(`${at} 不是对象`);
+                    }
+                    const o = x as Record<string, unknown>;
+                    if (typeof o.name !== "string" || !o.name.trim()) throw bad(`${at} 缺少 name`);
+                    if (typeof o.url !== "string" || !/^https?:\/\//.test(o.url)) {
+                      throw bad(`${at} 的 url 必须以 http:// 或 https:// 开头`);
+                    }
+                    if (o.kind !== undefined && (typeof o.kind !== "string" || !KIND.includes(o.kind))) {
+                      throw bad(`${at} 的 kind 只能是 ${KIND.join(" / ")}`);
+                    }
+                    if (o.protocol !== undefined && o.protocol !== null && typeof o.protocol !== "string") {
+                      throw bad(`${at} 的 protocol 必须是字符串或 null`);
+                    }
+                    if (o.enabled !== undefined && typeof o.enabled !== "boolean") {
+                      throw bad(`${at} 的 enabled 必须是布尔值`);
+                    }
+                  });
+                  sources = rows as Config["sources"];
                 }
                 // 基于服务端当前配置做增量覆盖：只改表单里出现的字段，
                 // 绝不能丢掉 base_path / tls / warp / xui 等未暴露的段
@@ -1023,7 +1052,15 @@ export function renderXui(root: HTMLElement): void {
     const mode = (document.getElementById("xui-mode") as HTMLSelectElement).value;
     const body: { template_id: number; ports?: number[]; residential_only: boolean } = {
       template_id: Number(sel.value) || 0,
-      residential_only: mode !== "balancer"
+      // Always false here. The previous `mode === "balancer" ? false : false` was
+      // a copy-paste leftover with two identical branches, but the observable
+      // behaviour was `false`, and that is what has to stay: the backend drops
+      // every entry whose exit is not positively classified residential, so
+      // sending `true` from the DEFAULT "每端口一条规则" mode silently discards
+      // all unselected/unclassified ports (an empty preview on a fresh install).
+      // There is no "仅住宅" control on this form — only `gen()` offers one — so
+      // do not guess one into existence here.
+      residential_only: false
     };
     if (mode !== "balancer") {
       const checked = checkedPorts();

@@ -249,13 +249,19 @@ impl AppState {
 
     /// Remove entries that have been dead for more than `days`.
     pub async fn prune(&self, days: u64) -> usize {
-        let cutoff = now_ts() - (days as i64 * 86400);
+        // clamp in u64 first: `days as i64 * 86400` would wrap on an absurd
+        // value, moving the cutoff into the future and pruning everything
+        let days = days.min(MAX_PRUNE_DAYS);
+        let cutoff = now_ts().saturating_sub((days as i64).saturating_mul(86400));
         let mut map = self.proxies.write().await;
         let before = map.len();
         map.retain(|_, p| p.alive || p.last_check.unwrap_or(0) > cutoff);
         before - map.len()
     }
 }
+
+/// Ceiling for [`AppState::prune`], see there.
+const MAX_PRUNE_DAYS: u64 = 365_000;
 
 fn next_free_port(used: &HashSet<u16>, base: u32, max: usize) -> Option<u16> {
     for i in 0..max {
@@ -269,4 +275,135 @@ fn next_free_port(used: &HashSet<u16>, base: u32, max: usize) -> Option<u16> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::TunnelStatus;
+
+    const OLD_STATE: &str = r#"{
+      "proxies": [{"key":"http://1.2.3.4:8080","protocol":"http","ip":"1.2.3.4","port":8080,"alive":true,"local_port":13000}],
+      "vpn_tunnels": [{"server_key":"1.2.3.4|443","hostname":"h","local_port":13001,"status":"up","attempts":1}],
+      "vpn_pool": [{"ip":"1.2.3.4","remote_port":443,"country_short":"JP"}]
+    }"#;
+
+    /// state.json written by an older build (plain strings) must still load.
+    #[test]
+    fn old_state_file_deserializes() {
+        let sf: StateFile = serde_json::from_str(OLD_STATE).expect("old state file must parse");
+        assert_eq!(sf.proxies.len(), 1);
+        assert_eq!(sf.proxies[0].local_port, Some(13000));
+        assert_eq!(sf.vpn_tunnels.len(), 1);
+        assert_eq!(sf.vpn_tunnels[0].status, TunnelStatus::Up);
+        // still readable by the historic literal comparisons
+        assert!(sf.vpn_tunnels[0].status == "up");
+        assert_eq!(sf.vpn_pool[0].country_short.as_deref(), Some("JP"));
+    }
+
+    /// and the statuses it wrote come back out unchanged, so the API keeps
+    /// emitting the same strings.
+    #[test]
+    fn status_round_trips_through_the_same_strings() {
+        for (raw, want) in [
+            ("spawning", TunnelStatus::Spawning),
+            ("up", TunnelStatus::Up),
+            ("down", TunnelStatus::Down),
+            ("failed", TunnelStatus::Failed),
+            ("rotated", TunnelStatus::Rotated),
+            ("blacklisted", TunnelStatus::Blacklisted),
+        ] {
+            let sf: StateFile = serde_json::from_str(&format!(
+                r#"{{"vpn_tunnels":[{{"server_key":"k","hostname":"h","local_port":1,"status":"{raw}"}}]}}"#
+            ))
+            .expect("status must parse");
+            assert_eq!(sf.vpn_tunnels[0].status, want);
+            assert_eq!(
+                serde_json::to_string(&sf.vpn_tunnels[0].status).unwrap(),
+                format!("\"{raw}\"")
+            );
+        }
+    }
+
+    /// A status from another version must not fail the whole load, and must not
+    /// compare equal to a real state (it is what keeps a bogus value out of the
+    /// rotation logic).
+    #[test]
+    fn unknown_status_is_kept_but_matches_nothing() {
+        let sf: StateFile = serde_json::from_str(
+            r#"{"vpn_tunnels":[{"server_key":"k","hostname":"h","local_port":1,"status":"half-open"}]}"#,
+        )
+        .expect("unknown status must not break the file");
+        let st = sf.vpn_tunnels[0].status;
+        assert_eq!(st, TunnelStatus::Unknown);
+        assert!(st != "up");
+        assert!(st != "failed");
+        assert!(st != "blacklisted");
+    }
+
+    /// A tunnel without a status falls back to the start of its lifecycle.
+    #[test]
+    fn missing_status_defaults_to_spawning() {
+        let sf: StateFile = serde_json::from_str(
+            r#"{"vpn_tunnels":[{"server_key":"k","hostname":"h","local_port":1}]}"#,
+        )
+        .expect("missing status must not break the file");
+        assert_eq!(sf.vpn_tunnels[0].status, TunnelStatus::Spawning);
+    }
+
+    /// The streaming writer must produce byte-identical JSON to the owned
+    /// struct it replaced: the file is re-read at startup and other tooling
+    /// parses it.
+    #[test]
+    fn streaming_writer_keeps_the_on_disk_shape() {
+        let mut map = HashMap::new();
+        for key in ["http://1.2.3.4:8080", "socks5://5.6.7.8:1080"] {
+            map.insert(
+                key.to_string(),
+                ProxyInfo {
+                    key: key.to_string(),
+                    ip: key
+                        .rsplit_once("://")
+                        .map(|(_, r)| r.split(':').next().unwrap_or("").to_string())
+                        .unwrap_or_default(),
+                    alive: true,
+                    local_port: Some(13000),
+                    ..Default::default()
+                },
+            );
+        }
+        let tunnels = vec![VpnTunnel {
+            server_key: "1.2.3.4|443".into(),
+            hostname: "h".into(),
+            local_port: 13001,
+            status: TunnelStatus::Blacklisted,
+            ..Default::default()
+        }];
+        let pool = vec![VpnServer {
+            ip: "1.2.3.4".into(),
+            remote_port: 443,
+            country_short: Some("JP".into()),
+            ..Default::default()
+        }];
+
+        let owned = StateFile {
+            proxies: map.values().cloned().collect(),
+            vpn_tunnels: tunnels.clone(),
+            vpn_pool: pool.clone(),
+        };
+        let streamed = StateFileRef {
+            proxies: &map,
+            vpn_tunnels: &tunnels,
+            vpn_pool: &pool,
+        };
+
+        let want = serde_json::to_string(&owned).unwrap();
+        let got = serde_json::to_string(&streamed).unwrap();
+        assert_eq!(got, want);
+        // and it round-trips back through the loader
+        let back: StateFile = serde_json::from_str(&got).unwrap();
+        assert_eq!(back.proxies.len(), 2);
+        assert_eq!(back.vpn_tunnels[0].status, TunnelStatus::Blacklisted);
+        assert_eq!(back.vpn_pool.len(), 1);
+    }
 }
