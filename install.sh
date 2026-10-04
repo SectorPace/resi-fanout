@@ -29,6 +29,7 @@ FROM_SOURCE="0"
 
 log()  { printf '\033[1;34m[install]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
+green() { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
@@ -426,20 +427,32 @@ svc_ctl() {
 ui_url() {
   c python3 || return 1
   python3 - "$CONF" <<'PY'
-import json, sys, socket
+import json, sys, socket, urllib.request
 cfg = json.load(open(sys.argv[1]))
 s = cfg["server"]
 host, _, port = s["listen"].rpartition(":")
+
+def public_ip():
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip"):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                ip = r.read().decode().strip()
+                if ip and not ip.startswith(("10.", "127.", "192.168.", "172.")):
+                    return ip
+        except Exception:
+            pass
+    return None
+
 if host in ("0.0.0.0", "::", ""):
-    try:
-        host = socket.gethostbyname(socket.gethostname())
-    except Exception:
-        host = "127.0.0.1"
+    # 云主机 hostname 常解析到内网地址，优先用公网 IP
+    host = public_ip() or socket.gethostbyname(socket.gethostname()) or "127.0.0.1"
 scheme = "https" if s.get("tls", {}).get("enabled") else "http"
 print(f"{scheme}://{host}:{port}{s.get('base_path', '')}/")
-if host == "127.0.0.1":
-    print(f"{yellow}  提示：仅本机可访问；公网请用 SSH 隧道或 --with-tls{plain}")
+if host.startswith(("10.", "192.168.", "172.")):
+    print("  提示：这是内网地址，公网访问请用你的公网 IP 替换")
+print(f"  若打不开：检查云安全组/防火墙是否放行 {port} 端口")
 PY
+}
 }
 
 status_panel() {
@@ -584,7 +597,7 @@ cat <<EOF
  管理菜单: 输入 rf 打开交互菜单（状态/启停/抓取/日志/更新/卸载）
 
  next steps:
-  1. open the UI (port-forward via ssh -L ${API_PORT}:127.0.0.1:${API_PORT})
+  1. 公网访问需在云安全组/防火墙放行 ${API_PORT} 端口（仅本机则用 ssh -L ${API_PORT}:127.0.0.1:${API_PORT}）
   2. wait for the first fetch+check cycle (~1-3 min), check 总览
   3. integrate with 3x-ui:
      bash ${PREFIX}/scripts/3xui-push.sh \\
