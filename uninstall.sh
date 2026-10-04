@@ -16,7 +16,11 @@ PURGE="0"
 [ "$(id -u)" = "0" ] || { echo "please run as root" >&2; exit 1; }
 
 systemctl disable --now "${SERVICE}" 2>/dev/null || true
-rm -f "/etc/systemd/system/${SERVICE}"
+systemctl disable --now resi-fanout-acme.timer 2>/dev/null || true
+rm -f "/etc/systemd/system/${SERVICE}" \
+      "/etc/systemd/system/resi-fanout-acme.service" \
+      "/etc/systemd/system/resi-fanout-acme.timer" \
+      "/usr/local/bin/rf"
 systemctl daemon-reload 2>/dev/null || true
 
 rm -rf "${PREFIX}"
