@@ -3,6 +3,8 @@ import { badge, el, toast } from "./main";
 
 const PAGE_SIZE = 100;
 
+const selectedKeys = new Set<string>();
+
 const proxyState = {
   alive: "1",
   residential: false,
@@ -64,7 +66,9 @@ export function renderProxies(root: HTMLElement): void {
           void reload();
         }),
         " 仅住宅"
-      )
+      ),
+      el("button", { class: "primary", onclick: () => void assignSelected() }, "为勾选节点开放端口"),
+      el("span", { id: "sel-info", class: "dim" }, "已选 0 个")
     ),
     el("div", { id: "proxy-table" }),
     el(
@@ -89,6 +93,21 @@ export function renderProxies(root: HTMLElement): void {
   }
 
   let proxySeq = 0;
+  async function assignSelected(): Promise<void> {
+    const keys = Array.from(selectedKeys);
+    if (!keys.length) {
+      toast("请先在表格里勾选要开放的节点", false);
+      return;
+    }
+    try {
+      const r = await api.portsAssign(keys);
+      toast(`已为 ${r.assigned.length} 个节点开放端口`);
+      selectedKeys.clear();
+      await reload(true);
+    } catch (e) { toast(String(e), false); }
+  }
+
+
   async function reload(resetPaging = false): Promise<void> {
     const box = document.getElementById("proxy-table");
     if (!box) return;
@@ -124,6 +143,7 @@ export function renderProxies(root: HTMLElement): void {
             el(
               "tr",
               {},
+              el("th", { style: "width:28px" }, ""),
               el("th", {}, "代理"),
               el("th", {}, "协议"),
               el("th", {}, "国家"),
@@ -140,6 +160,17 @@ export function renderProxies(root: HTMLElement): void {
               el(
                 "tr",
                 {},
+                el("td", {}, (() => {
+                  const cb = el("input", { type: "checkbox" }) as HTMLInputElement;
+                  cb.checked = selectedKeys.has(p.key);
+                  cb.addEventListener("change", () => {
+                    if (cb.checked) selectedKeys.add(p.key);
+                    else selectedKeys.delete(p.key);
+                    const info = document.getElementById("sel-info");
+                    if (info) info.textContent = `已选 ${selectedKeys.size} 个`;
+                  });
+                  return cb;
+                })()),
                 el("td", { class: "mono" }, p.key),
                 el("td", {}, p.protocol),
                 el("td", {}, p.country_code || "—"),
@@ -206,7 +237,8 @@ export function renderPorts(root: HTMLElement): void {
               el("th", {}, "协议"),
               el("th", {}, "国家"),
               el("th", {}, "延迟"),
-              el("th", {}, "类型")
+              el("th", {}, "类型"),
+              el("th", {}, "")
             )
           ),
           el(
@@ -227,7 +259,16 @@ export function renderPorts(root: HTMLElement): void {
                   p.residential ? badge("住宅", "res") : badge("机房", ""),
                   " ",
                   p.kind === "vpngate" ? badge("VPN Gate", "") : ""
-                )
+                ),
+                el("td", {}, el("button", {
+                  onclick: async () => {
+                    try {
+                      await api.portsRelease({ ports: [p.port] });
+                      toast(`已释放端口 ${p.port}（节点仍在池中）`);
+                      await reload();
+                    } catch (e) { toast(String(e), false); }
+                  }
+                }, "释放"))
               )
             )
           )
@@ -680,6 +721,16 @@ export async function renderConfig(root: HTMLElement): Promise<void> {
         chk("c-vg-resi", "仅保留住宅出口隧道（机房出口自动换点）", cfg.vpngate.only_residential)
       )
     ),
+      el(
+        "fieldset",
+        {},
+        el("legend", {}, "3x-ui 面板联动"),
+        f("面板数据库路径", "c-xui-db", cfg.xui.db_path, "找不到时会在常见位置自动探测"),
+        f("入站起始端口", "c-xui-port", cfg.xui.inbound_port_base),
+        f("入站 tag 前缀", "c-xui-in", cfg.xui.inbound_prefix),
+        f("出站 tag 前缀", "c-xui-out", cfg.xui.outbound_prefix),
+        chk("c-xui-restart", "写库后自动重启面板", cfg.xui.auto_restart)
+      ),
     el(
       "fieldset",
       {},
@@ -740,6 +791,14 @@ export async function renderConfig(root: HTMLElement): Promise<void> {
                     protocols: get("c-protocols")
                       ? get("c-protocols").split(",").map((s) => s.trim()).filter(Boolean)
                       : []
+                  },
+                  xui: {
+                    ...cfg.xui,
+                    db_path: get("c-xui-db"),
+                    inbound_port_base: getn("c-xui-port"),
+                    inbound_prefix: get("c-xui-in"),
+                    outbound_prefix: get("c-xui-out"),
+                    auto_restart: (document.getElementById("c-xui-restart") as HTMLInputElement).checked
                   },
                   vpngate: {
                     ...cfg.vpngate,

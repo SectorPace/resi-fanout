@@ -87,6 +87,37 @@ pub async fn entries_for(
     entries
 }
 
+/// 面板数据库不一定在 /etc/x-ui/（不同安装方式位置不同），
+/// 配置里指定的路径不存在时按常见位置探测，并把结果用于后续操作。
+pub fn resolve_db_path(cfg: &crate::config::XuiCfg) -> String {
+    if std::path::Path::new(&cfg.db_path).exists() {
+        return cfg.db_path.clone();
+    }
+    for cand in [
+        "/etc/x-ui/x-ui.db",
+        "/usr/local/x-ui/x-ui.db",
+        "/usr/local/x-ui/bin/x-ui.db",
+        "/opt/x-ui/x-ui.db",
+        "/etc/x-ui/db/x-ui.db",
+    ] {
+        if std::path::Path::new(cand).exists() {
+            return cand.to_string();
+        }
+    }
+    cfg.db_path.clone()
+}
+
+pub fn probed_paths(cfg: &crate::config::XuiCfg) -> String {
+    [
+        cfg.db_path.clone(),
+        "/etc/x-ui/x-ui.db".into(),
+        "/usr/local/x-ui/x-ui.db".into(),
+        "/usr/local/x-ui/bin/x-ui.db".into(),
+        "/opt/x-ui/x-ui.db".into(),
+    ]
+    .join(", ")
+}
+
 pub fn script_args(
     cfg: &crate::config::XuiCfg,
     cmd: &str,
@@ -96,7 +127,7 @@ pub fn script_args(
     vec![
         cmd.to_string(),
         "--db".into(),
-        cfg.db_path.clone(),
+        resolve_db_path(cfg),
         "--template-id".into(),
         template_id.to_string(),
         "--entries".into(),

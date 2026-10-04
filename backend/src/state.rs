@@ -168,6 +168,10 @@ impl AppState {
     /// whenever still valid to avoid port churn.
     pub async fn assign_ports(&self) {
         let cfg = self.config().await;
+        // 手动模式：端口完全由用户在 UI 里勾选决定，自动分配不介入
+        if !cfg.fanout.auto_assign {
+            return;
+        }
         let max = cfg.fanout.max_ports as usize;
         if max == 0 {
             return;

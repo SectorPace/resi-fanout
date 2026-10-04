@@ -142,6 +142,15 @@ export interface Config {
     api_url: string;
     scripts_dir: string;
   };
+  xui: {
+    db_path: string;
+    script_path: string;
+    inbound_port_base: number;
+    inbound_prefix: string;
+    outbound_prefix: string;
+    host: string;
+    auto_restart: boolean;
+  };
   sources: { name: string; kind: string; url: string; protocol: string | null; enabled: boolean }[];
 }
 
@@ -227,6 +236,12 @@ export const api = {
   proxies: (query: string): Promise<{ total: number; items: ProxyItem[] }> =>
     req("GET", `/api/proxies?${query}`),
   ports: (): Promise<{ items: PortEntry[] }> => req("GET", "/api/ports"),
+  portsAssign: (keys: string[]): Promise<{ ok: boolean; assigned: { key: string; port: number }[] }> =>
+    req("POST", "/api/ports/assign", { keys }),
+  portsRelease: (p: { ports?: number[]; keys?: string[] }): Promise<{ ok: boolean; released: number }> =>
+    req("POST", "/api/ports/release", p),
+  portsMode: (auto: boolean): Promise<{ ok: boolean; auto: boolean }> =>
+    req("POST", "/api/ports/mode", { auto }),
   refresh: (): Promise<{ ok: boolean }> => req("POST", "/api/refresh"),
   check: (keys?: string[]): Promise<{ ok: boolean }> =>
     req("POST", "/api/check", keys && keys.length ? { keys } : {}),

@@ -71,6 +71,9 @@ pub struct FanoutCfg {
     /// Protocol spoken on the local ports: socks | http | mixed.
     pub mode: FanoutMode,
     pub max_ports: u32,
+    /// true = 按延迟自动把端口铺给最好的节点；
+    /// false = 只给用户在 UI 里勾选的节点分配端口
+    pub auto_assign: bool,
 }
 
 impl Default for FanoutCfg {
@@ -82,6 +85,7 @@ impl Default for FanoutCfg {
             // keep the default modest; fanout ports are localhost-only, so
             // raise this in the UI only if you actually need more exits
             max_ports: 20,
+            auto_assign: true,
         }
     }
 }

@@ -46,6 +46,9 @@ pub fn router(state: Arc<AppState>, web_root: &str, base_path: &str) -> Router {
         .route("/xui/preview", post(xui_preview))
         .route("/xui/link", post(xui_link))
         .route("/xui/unlink", post(xui_unlink))
+        .route("/ports/assign", post(ports_assign))
+        .route("/ports/release", post(ports_release))
+        .route("/ports/mode", post(ports_mode))
         .route("/warp", get(warp_status))
         .route("/warp/register", post(warp_register))
         .route("/warp/import", post(warp_import))
@@ -212,6 +215,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
         "residential": residential,
         "ports": with_port,
         "max_ports": cfg.fanout.max_ports,
+        "auto_assign": cfg.fanout.auto_assign,
         "vpn_enabled": cfg.vpngate.enabled,
         "vpn_total": vpn_total,
         "vpn_up": vpn_up,
@@ -497,11 +501,15 @@ async fn vpngate_rebuild(State(state): State<Arc<AppState>>) -> Response {
 
 async fn xui_inbounds(State(state): State<Arc<AppState>>) -> Response {
     let cfg = state.config().await;
-    let args = ["list".to_string(), "--db".into(), cfg.xui.db_path.clone()];
+    let db = crate::xui::resolve_db_path(&cfg.xui);
+    let args = ["list".to_string(), "--db".into(), db.clone()];
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     match crate::xui::run_script(&cfg.xui, &arg_refs).await {
         Ok(v) => Json(v).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+        Err(e) => {
+            let msg = format!("{e}（已探测: {}）", crate::xui::probed_paths(&cfg.xui));
+            (StatusCode::BAD_REQUEST, msg).into_response()
+        }
     }
 }
 
@@ -590,7 +598,7 @@ async fn xui_unlink(State(state): State<Arc<AppState>>) -> Response {
     let args = [
         "unlink".to_string(),
         "--db".into(),
-        cfg.xui.db_path.clone(),
+        crate::xui::resolve_db_path(&cfg.xui),
         "--inbound-prefix".into(),
         cfg.xui.inbound_prefix.clone(),
         "--outbound-prefix".into(),
@@ -719,6 +727,129 @@ async fn xui_snippet(
     };
 
     Json(snippet::build_with(&entries, &prefix, &mode, &inbound)).into_response()
+}
+
+/// 手动为选中的代理节点分配本地端口（按延迟排序占用最低的空闲端口）
+async fn ports_assign(State(state): State<Arc<AppState>>, body: Option<Json<Value>>) -> Response {
+    let keys: Vec<String> = body
+        .as_ref()
+        .and_then(|b| b.0.get("keys"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    if keys.is_empty() {
+        return (StatusCode::BAD_REQUEST, "keys 为空：请先在节点池勾选要开放的节点").into_response();
+    }
+    let cfg = state.config().await;
+    if cfg.fanout.max_ports == 0 {
+        return (StatusCode::BAD_REQUEST, "max_ports 为 0，请先在配置里调大").into_response();
+    }
+    let mut assigned = Vec::new();
+    {
+        let mut map = state.proxies.write().await;
+        // 已占用的端口
+        let mut used: Vec<u16> = map.values().filter_map(|p| p.local_port).collect();
+        let mut keys = keys.clone();
+        keys.sort_by_key(|k| {
+            map.get(k).and_then(|p| p.latency_ms).unwrap_or(u64::MAX)
+        });
+        for k in keys {
+            let Some(p) = map.get_mut(&k) else { continue };
+            if p.local_port.is_some() {
+                assigned.push(json!({"key": k, "port": p.local_port}));
+                continue;
+            }
+            if used.len() >= cfg.fanout.max_ports as usize {
+                break;
+            }
+            let base = cfg.fanout.base_port as u32;
+            let mut port = None;
+            for i in 0..cfg.fanout.max_ports as u32 {
+                let cand = base + i;
+                if cand > 65535 {
+                    break;
+                }
+                let c = cand as u16;
+                if !used.contains(&c) {
+                    port = Some(c);
+                    break;
+                }
+            }
+            let Some(p2) = port else { break };
+            used.push(p2);
+            map.get_mut(&k).map(|p| p.local_port = Some(p2));
+            assigned.push(json!({"key": k, "port": p2}));
+        }
+    }
+    // 关掉自动分配，避免下一轮把手动结果覆盖
+    {
+        let mut c = state.cfg.write().await;
+        if c.fanout.auto_assign {
+            c.fanout.auto_assign = false;
+            let _ = state.save_config().await;
+        }
+    }
+    state.dirty.store(true, Ordering::Relaxed);
+    Json(json!({ "ok": true, "assigned": assigned })).into_response()
+}
+
+/// 释放端口（节点保留在池中）
+async fn ports_release(State(state): State<Arc<AppState>>, body: Option<Json<Value>>) -> Response {
+    let ports: Vec<u16> = body
+        .as_ref()
+        .and_then(|b| b.0.get("ports"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_u64()).filter_map(|x| u16::try_from(x).ok()).collect())
+        .unwrap_or_default();
+    let keys: Vec<String> = body
+        .as_ref()
+        .and_then(|b| b.0.get("keys"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let mut map = state.proxies.write().await;
+    let mut released = 0usize;
+    for p in map.values_mut() {
+        let hit_port = ports.contains(&p.local_port.unwrap_or(0));
+        let hit_key = keys.contains(&p.key);
+        if hit_port || hit_key {
+            if p.local_port.is_some() {
+                released += 1;
+            }
+            p.local_port = None;
+        }
+    }
+    drop(map);
+    state.dirty.store(true, Ordering::Relaxed);
+    Json(json!({ "ok": true, "released": released })).into_response()
+}
+
+/// 切换自动分配模式
+async fn ports_mode(State(state): State<Arc<AppState>>, body: Option<Json<Value>>) -> Response {
+    let enabled = body
+        .as_ref()
+        .and_then(|b| b.0.get("auto"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    {
+        let mut c = state.cfg.write().await;
+        c.fanout.auto_assign = enabled;
+    }
+    if let Err(e) = state.save_config().await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, format!("save: {e}")).into_response();
+    }
+    if enabled {
+        state.assign_ports().await;
+    } else {
+        // 切到手动：把此前自动铺上的端口全部收回，由用户自己勾选
+        let mut map = state.proxies.write().await;
+        for p in map.values_mut() {
+            p.local_port = None;
+        }
+        drop(map);
+        state.dirty.store(true, Ordering::Relaxed);
+    }
+    Json(json!({ "ok": true, "auto": enabled })).into_response()
 }
 
 async fn collect_port_entries(state: &Arc<AppState>) -> Vec<PortEntry> {
