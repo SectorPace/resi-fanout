@@ -607,7 +607,7 @@ k = json.load(open('$CONF'))['server']['api_key']
 print((k[:4] + '****' + k[-4:]) if len(k) > 10 else ('（未设置）' if not k else '****'))" 2>/dev/null)"
          blue "Key：${MASKED}（完整值请执行 rf key）" ;;
       9) curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash ;;
-      11) doctor ;;
+      11) do_doctor ;;
       10) readp "确认卸载？[y/N]：" yn
           [ "$yn" = "y" ] && curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/uninstall.sh | sudo bash && exit 0 ;;
       0|*) exit 0 ;;
@@ -701,6 +701,15 @@ esac
 RFEOF
 if bash -n /usr/local/bin/rf 2>/dev/null; then
   chmod +x /usr/local/bin/rf
+  # 语法检查查不出「调用了不存在的函数」，这里再核一遍菜单项
+  DEFINED="$(grep -oE '^[a-z_]+\(\)' /usr/local/bin/rf | tr -d '()' | sort -u)"
+  BAD=""
+  for fn in $(grep -oE '^[[:space:]]+[0-9]+\)[[:space:]]+[a-z_]+' /usr/local/bin/rf | awk '{print $2}' | sort -u); do
+    echo "$DEFINED" | grep -qx "$fn" && continue
+    case "$fn" in curl|systemctl|journalctl|x-ui|rf) continue ;; esac
+    BAD="${BAD} ${fn}"
+  done
+  [ -n "${BAD}" ] && warn "rf 菜单项调用了未定义函数：${BAD}（这些菜单项会报 command not found）"
 else
   warn "rf 脚本语法自检失败，已保留但未授权执行（可手动查看 /usr/local/bin/rf）"
 fi
