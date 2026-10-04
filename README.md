@@ -33,11 +33,11 @@
 ## 快速开始（Linux）
 
 ```bash
-# 一键安装（自动匹配架构下载 Release 预编译包，无需装工具链）
+# 一键安装（自动下载预编译包；默认签发 ACME IP 证书并开启公网 HTTPS + 随机路径）
 curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash
 
 # 带参数的一键安装（注意 bash -s -- 后跟参数）
-curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash -s -- --with-vpngate --with-warp --with-3xui
+curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash -s -- --with-warp --with-masque
 
 # 或者 clone 后本地运行
 git clone https://github.com/SectorPace/resi-fanout.git && cd resi-fanout
@@ -49,6 +49,7 @@ sudo bash install.sh
 --port 7654        # 指定 API/UI 端口
 --with-3xui        # 装完自动把出站推进本机 3x-ui
 --with-vpngate     # 装 openvpn 并启用 VPN Gate 隧道
+--no-tls           # 不签 IP 证书，仅本机 HTTP（默认会尝试签证书开公网 HTTPS）
 --from-source      # 强制源码编译（预编译包要求 glibc >= 2.35，Debian 12 / Ubuntu 22.04+；更老系统用这个）
 --no-frontend      # 跳过 npm 构建（用仓库自带 dist）
 --repo <git-url>   # 指定仓库地址

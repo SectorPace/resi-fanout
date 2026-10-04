@@ -21,7 +21,7 @@ WITH_3XUI="0"
 WITH_VPNGATE="0"
 WITH_WARP="0"
 WITH_MASQUE="0"
-WITH_TLS="0"
+WITH_TLS="1"    # 默认公网+TLS；--no-tls 可关闭
 REPO_URL="${REPO_URL:-https://github.com/SectorPace/resi-fanout.git}"
 GH_REPO="${GH_REPO:-SectorPace/resi-fanout}"
 NO_FRONTEND="0"
@@ -39,7 +39,8 @@ while [ $# -gt 0 ]; do
     --with-vpngate) WITH_VPNGATE="1"; shift ;;
     --with-warp)   WITH_WARP="1"; shift ;;
     --with-masque) WITH_MASQUE="1"; shift ;;
-    --with-tls)   WITH_TLS="1"; shift ;;
+    --with-tls)   WITH_TLS="1"; shift ;;   # 默认已开，保留兼容
+    --no-tls)     WITH_TLS="0"; shift ;;   # 不签证书，仅本机 HTTP
     --from-source) FROM_SOURCE="1"; shift ;;
     --no-frontend) NO_FRONTEND="1"; shift ;;
     -h|--help)
@@ -166,26 +167,33 @@ if [ "${WITH_MASQUE}" = "1" ]; then
   fi
 fi
 
-# ---------------------------------------------------------------- ACME IP cert
+# ---------------------------------------------------------------- ACME IP cert (default on)
+# 默认签发 Let's Encrypt IP 证书并监听 0.0.0.0；任何一步失败都会
+# 自动降级为仅本机 HTTP（--no-tls 可显式关闭）。
 TLS_DIR="${CONF_DIR}/tls"
-if [ "${WITH_TLS}" = "1" ]; then
-  log "准备 ACME IP 证书（Let's Encrypt，面向 IP 签发 6 天证书）"
+BASE_PATH=""
+
+try_issue_cert() {
   PUBLIC_IP="${ACME_IP:-$(curl -fsS --max-time 10 https://api.ipify.org 2>/dev/null || curl -fsS --max-time 10 https://ifconfig.me/ip 2>/dev/null || true)}"
-  [ -n "${PUBLIC_IP}" ] || die "无法探测公网 IP，请用 ACME_IP=<你的IP> 指定"
+  if [ -z "${PUBLIC_IP}" ]; then
+    warn "无法探测公网 IP（可用 ACME_IP=<你的IP> 指定）—— 降级为仅本机 HTTP"
+    return 1
+  fi
 
   if ! command -v lego >/dev/null 2>&1; then
     log "安装 lego（ACME 客户端，支持 RFC 8738 IP 证书）"
     case "$(uname -m)" in
       x86_64)        LEGO_URL="https://github.com/go-acme/lego/releases/download/v5.5.2/lego_v5.5.2_linux_amd64.tar.gz" ;;
       aarch64|arm64) LEGO_URL="https://github.com/go-acme/lego/releases/download/v5.5.2/lego_v5.5.2_linux_arm64.tar.gz" ;;
-      *) die "该架构没有 lego 预编译包，请手动申请证书后把 cert/key 路径填进配置" ;;
+      *) warn "该架构没有 lego 预编译包"; return 1 ;;
     esac
     T="$(mktemp -d)"
     if curl -fsSL "${LEGO_URL}" | tar xz -C "${T}" && [ -f "${T}/lego" ]; then
       install -m 755 "${T}/lego" /usr/local/bin/lego
     else
-      die "lego 下载失败（404/网络）。手动安装：
+      warn "lego 下载失败（404/网络）。手动安装：
       curl -fsSL ${LEGO_URL} | tar xz -C /usr/local/bin && chmod +x /usr/local/bin/lego"
+      return 1
     fi
   fi
 
@@ -196,23 +204,31 @@ if [ "${WITH_TLS}" = "1" ]; then
   log "为 ${PUBLIC_IP} 申请证书（HTTP-01 需要 80 端口可从公网访问）"
   if ! lego ${ACME_ARGS} --profile shortlived; then
     warn "shortlived profile 申请失败，改用默认 profile 重试"
-    lego ${ACME_ARGS} || die "证书申请失败：80 端口需可从公网访问（被占用就停掉占用者，或改用 DNS-01）"
+    lego ${ACME_ARGS} || { warn "证书申请失败：80 端口需可从公网访问（被占用就停掉占用者，或改用 DNS-01）—— 降级为仅本机 HTTP"; return 1; }
   fi
 
   CRT="$(ls -1 "${TLS_DIR}"/*.crt 2>/dev/null | head -1)"
   KEY="$(ls -1 "${TLS_DIR}"/*.key 2>/dev/null | head -1)"
-  [ -n "${CRT}" ] && [ -n "${KEY}" ] || die "未在 ${TLS_DIR} 找到签发出来的证书"
+  if [ -z "${CRT}" ] || [ -z "${KEY}" ]; then
+    warn "未在 ${TLS_DIR} 找到签发出来的证书 —— 降级为仅本机 HTTP"
+    return 1
+  fi
   cp -f "${CRT}" "${TLS_DIR}/fullchain.pem"
   cp -f "${KEY}" "${TLS_DIR}/privkey.pem"
   chmod 600 "${TLS_DIR}/privkey.pem"
+  return 0
+}
 
-  BASE_PATH="/$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' 
-')"
-  log "证书就绪，稍后写入配置：https://<你的IP>:${API_PORT}${BASE_PATH}"
+if [ "${WITH_TLS}" = "1" ]; then
+  log "准备 ACME IP 证书（Let's Encrypt，6 天证书自动续期；失败会降级为仅本机 HTTP）"
+  if try_issue_cert; then
+    BASE_PATH="/$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    TLS_ENABLED="https://"
+    log "证书就绪：https://<你的IP>:${API_PORT}${BASE_PATH}"
 
-  # renewal: 6-day certs, so renew twice a day; the service hot-reloads it
-  log "注册自动续期定时器（resi-fanout-acme.timer）"
-  cat > /etc/systemd/system/resi-fanout-acme.service <<EOF2
+    # renewal: 6-day certs, so renew twice a day; the service hot-reloads it
+    log "注册自动续期定时器（resi-fanout-acme.timer）"
+    cat > /etc/systemd/system/resi-fanout-acme.service <<EOF2
 [Unit]
 Description=Renew the ACME IP certificate used by resi-fanout
 After=network-online.target
@@ -221,7 +237,7 @@ After=network-online.target
 Type=oneshot
 ExecStart=/bin/sh -c 'lego --server https://acme-v02.api.letsencrypt.org/directory --accept-tos --path ${TLS_DIR} --domains ${PUBLIC_IP} run && cp -f ${TLS_DIR}/*.crt ${TLS_DIR}/fullchain.pem && cp -f ${TLS_DIR}/*.key ${TLS_DIR}/privkey.pem'
 EOF2
-  cat > /etc/systemd/system/resi-fanout-acme.timer <<EOF2
+    cat > /etc/systemd/system/resi-fanout-acme.timer <<EOF2
 [Unit]
 Description=Twice-daily ACME IP certificate renewal
 
@@ -233,8 +249,12 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 EOF2
-  systemctl daemon-reload
-  systemctl enable --now resi-fanout-acme.timer >/dev/null 2>&1 || warn "定时器注册失败，可手动续期"
+    systemctl daemon-reload
+    systemctl enable --now resi-fanout-acme.timer >/dev/null 2>&1 || warn "定时器注册失败，可手动续期"
+  else
+    WITH_TLS="0"
+    warn "已降级：本次安装仅监听 127.0.0.1（HTTP）。之后可重跑安装重试 TLS。"
+  fi
 fi
 
 # ---------------------------------------------------------------- toolchain
