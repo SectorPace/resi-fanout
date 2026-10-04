@@ -577,14 +577,30 @@ EOF
 
 systemctl daemon-reload
 # enable --now 对已在运行的服务不会重启，配置改动（如 TLS/监听地址）不会生效
-systemctl enable "${SERVICE}" >/dev/null 2>&1 || true
-systemctl restart "${SERVICE}"
+# 开机自启 + 确保现在就在运行（restart 对已停止的服务同样会启动）
+systemctl enable "${SERVICE}" >/dev/null 2>&1 || warn "设置开机自启失败"
+log "启动服务…"
+if ! systemctl restart "${SERVICE}"; then
+  warn "systemctl restart 返回了失败状态"
+fi
 
-sleep 2
-if systemctl is-active --quiet "${SERVICE}"; then
-  log "service is running"
+LISTEN_ADDR="$(python3 -c "import json;print(json.load(open('${CONF_DIR}/config.json'))['server']['listen'])" 2>/dev/null || echo "127.0.0.1:${API_PORT}")"
+LISTEN_PORT="${LISTEN_ADDR##*:}"
+# 等端口真正 LISTEN 再报成功，避免"进程活着但没监听"的假象
+for _ in $(seq 1 15); do
+  if (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -q ":${LISTEN_PORT}[[:space:]]"; then
+    break
+  fi
+  systemctl is-active --quiet "${SERVICE}" || break
+  sleep 1
+done
+
+if systemctl is-active --quiet "${SERVICE}" && \
+   (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -q ":${LISTEN_PORT}[[:space:]]"; then
+  green "✔ 服务已启动并监听 ${LISTEN_ADDR}（已设置开机自启）"
 else
-  warn "service did not come up — check: journalctl -u ${SERVICE} -e"
+  warn "服务未正常启动/监听 ${LISTEN_ADDR}，最近 20 行日志："
+  journalctl -u "${SERVICE}" -n 20 --no-pager 2>/dev/null || warn "（无法读取 journalctl）"
 fi
 
 API_KEY_NOW="${API_KEY:-$(python3 -c "import json;print(json.load(open('${CONF_DIR}/config.json'))['server']['api_key'])" 2>/dev/null || echo '')}"
@@ -600,6 +616,7 @@ cat <<EOF
   logs   : journalctl -u ${SERVICE} -f
 
  管理菜单: 输入 rf 打开交互菜单（状态/启停/抓取/日志/更新/卸载）
+ 自动启动: 已设置开机自启（systemctl enable ${SERVICE}），rf restart 可手动重启
 
  next steps:
   1. 公网访问需在云安全组/防火墙放行 ${API_PORT} 端口（仅本机则用 ssh -L ${API_PORT}:127.0.0.1:${API_PORT}）
