@@ -644,11 +644,17 @@ mod tests {
 
     #[test]
     fn preserves_inline_blocks_verbatim() {
-        let src = "client\n<ca>\n-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n</ca>\nremote 1.2.3.4 443";
-        assert_eq!(kept(src), src);
+        // sanitize_remote_config re-joins the lines it kept with '\n', so the
+        // result always ends in a newline even when the input did not (which is
+        // also what OpenVPN wants).
+        let body = "client\n<ca>\n-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n</ca>\nremote 1.2.3.4 443";
+        assert_eq!(kept(body), format!("{body}\n"));
         // one-line form
         let one = "client\n<ca>-----BEGIN CERTIFICATE-----</ca>\nremote 1.2.3.4 443";
-        assert_eq!(kept(one), one);
+        assert_eq!(kept(one), format!("{one}\n"));
+        // and nothing inside the block was filtered
+        assert!(kept(body).contains("-----BEGIN CERTIFICATE-----"));
+        assert!(kept(body).contains("remote 1.2.3.4 443"));
     }
 
     #[test]

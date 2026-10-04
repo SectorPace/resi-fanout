@@ -285,7 +285,7 @@ mod tests {
     const OLD_STATE: &str = r#"{
       "proxies": [{"key":"http://1.2.3.4:8080","protocol":"http","ip":"1.2.3.4","port":8080,"alive":true,"local_port":13000}],
       "vpn_tunnels": [{"server_key":"1.2.3.4|443","hostname":"h","local_port":13001,"status":"up","attempts":1}],
-      "vpn_pool": [{"ip":"1.2.3.4","remote_port":443,"country_short":"JP"}]
+      "vpn_pool": [{"hostname":"public-vpn-1","ip":"1.2.3.4","remote_port":443,"country_short":"JP"}]
     }"#;
 
     /// state.json written by an older build (plain strings) must still load.
