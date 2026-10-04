@@ -1,4 +1,5 @@
 import { api, fmtTs, fmtUptime, getKey, setKey, type Status } from "./api";
+import "./style.css";
 import { renderProxies, renderPorts, renderConfig, renderXui, renderVpngate } from "./views";
 
 export function el<K extends keyof HTMLElementTagNameMap>(
@@ -52,11 +53,14 @@ async function pollStatus(): Promise<void> {
   if (!box || !srcBox) return;
   try {
     const s: Status = await api.status();
+    const verChip = document.getElementById("ver-chip");
+    if (verChip) verChip.textContent = `v${s.version}`;
     box.replaceChildren(
       card("节点总数", String(s.total)),
       card("存活", String(s.alive), s.alive > 0 ? "ok" : "warn"),
-      card("住宅 IP", String(s.residential), s.residential > 0 ? "ok" : ""),
+      card("住宅 IP", String(s.residential), s.residential > 0 ? "res" : ""),
       card("已分配端口", `${s.ports} / ${s.max_ports}`),
+      card("VPN Gate 出口", `${s.vpn_up} 在线`),
       card("运行时长", fmtUptime(s.uptime_secs)),
       card("上次刷新", fmtTs(s.last_refresh))
     );
@@ -178,6 +182,10 @@ function buildShell(): void {
       el("section", { id: "view-vpngate", class: "view", style: "display:none" }),
       el("section", { id: "view-config", class: "view", style: "display:none" }),
       el("section", { id: "view-xui", class: "view", style: "display:none" })
+    ),
+    el("footer", { class: "footer" },
+      el("span", {}, "Resi-Fanout — 住宅代理扇出控制台"),
+      el("a", { href: "https://github.com/SectorPace/resi-fanout", target: "_blank" }, "GitHub")
     )
   );
 
