@@ -30,6 +30,10 @@
   2. `scripts/3xui-push.sh` 自动写入 3x-ui 数据库（`settings.xrayTemplateConfig`，先备份）并重启面板。
 - **调度**：定时抓取新列表、复检全池、淘汰死节点，全部持久化到 `state.json`，重启不丢。
 
+## 版本
+
+遵循 [SemVer](https://semver.org/lang/zh-CN/)：`1.0.z` 修 bug、`1.y.0` 加功能、`2.0.0` 破坏性变更。当前首个正式版 **v1.0.0**，详见 [CHANGELOG](CHANGELOG.md)。
+
 ## 快速开始（Linux）
 
 ```bash
