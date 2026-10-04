@@ -353,15 +353,17 @@ fi
 log "installing global CLI: /usr/local/bin/rf"
 cat > /usr/local/bin/rf <<'RFEOF'
 #!/usr/bin/env bash
-# rf — resi-fanout 管理命令
-#   rf                 状态概览 + UI 地址
-#   rf start|stop|restart
-#   rf logs [n|-f]     日志（默认 50 行）
-#   rf api <path>      调用本地 API（自动带 Key），如 rf api ports
-#   rf ui              打印 UI 完整地址
-#   rf key             打印 API Key
-#   rf update          自更新（重跑官方安装脚本，保留配置）
-#   rf uninstall       卸载
+# rf — resi-fanout 管理脚本（参考 sing-box-yg 的交互菜单风格）
+#   直接输入 rf 打开管理菜单；也支持子命令脚本化调用：
+#   rf status|start|stop|restart|logs [n|-f]|api <path>|ui|key|update|uninstall|version
+
+red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;36m'; plain='\033[0m'
+red()    { echo -e "${red}$*${plain}"; }
+green()  { echo -e "${green}$*${plain}"; }
+yellow() { echo -e "${yellow}$*${plain}"; }
+blue()   { echo -e "${blue}$*${plain}"; }
+readp()  { echo -en "${yellow}$1${plain}"; read -r "$2"; }
+
 CONF="${RF_CONF:-/etc/resi-fanout/config.json}"
 SVC="resi-fanout"
 c() { command -v "$1" >/dev/null 2>&1; }
@@ -376,12 +378,17 @@ key = cfg["server"]["api_key"]
 req = urllib.request.Request(
     f"http://127.0.0.1:{port}{sys.argv[2]}",
     headers={"Authorization": f"Bearer {key}"} if key else {})
-print(urllib.request.urlopen(req, timeout=10).read().decode())
+print(urllib.request.urlopen(req, timeout=15).read().decode())
 PY
 }
 
+svc_ctl() {
+  c systemctl || { yellow "本机没有 systemctl（可能未安装或非 Linux）"; return 1; }
+  systemctl "$1" "$SVC" && blue "✔ $1 完成"
+}
+
 ui_url() {
-  c python3 || { echo "(需要 python3)"; return; }
+  c python3 || return 1
   python3 - "$CONF" <<'PY'
 import json, sys, socket
 cfg = json.load(open(sys.argv[1]))
@@ -392,64 +399,99 @@ if host in ("0.0.0.0", "::", ""):
         host = socket.gethostbyname(socket.gethostname())
     except Exception:
         host = "127.0.0.1"
-if host == "127.0.0.1":
-    note = "  (仅本机可访问；公网请用 SSH 隧道或 --with-tls)"
-else:
-    note = ""
 scheme = "https" if s.get("tls", {}).get("enabled") else "http"
 print(f"{scheme}://{host}:{port}{s.get('base_path', '')}/")
-if note:
-    print(note)
+if host == "127.0.0.1":
+    print(f"{yellow}  提示：仅本机可访问；公网请用 SSH 隧道或 --with-tls{plain}")
 PY
 }
 
-case "${1:-}" in
-  ""|status)
-    if c systemctl; then systemctl status "$SVC" --no-pager -l 2>/dev/null | sed -n '1,4p'; fi
-    if [ -f "$CONF" ] && c python3; then
-      api /api/status 2>/dev/null | python3 -c 'import json,sys
+status_panel() {
+  if c systemctl && systemctl is-active --quiet "$SVC" 2>/dev/null; then
+    blue "服务状态：运行中"
+  elif c systemctl; then
+    red "服务状态：未运行（菜单 2 启动）"
+  else
+    yellow "服务状态：未知（本机无 systemctl）"
+  fi
+  if [ -f "$CONF" ] && c python3; then
+    api /api/status 2>/dev/null | python3 -c 'import json,sys
 try:
     d = json.load(sys.stdin)
-    print("节点 %d | 存活 %d | 住宅 %d | 端口 %d/%d" % (d["total"], d["alive"], d["residential"], d["ports"], d["max_ports"]))
+    print("代理节点：%d（存活 %d，住宅 %d）" % (d["total"], d["alive"], d["residential"]))
+    print("本地端口：%d / %d" % (d["ports"], d["max_ports"]))
+    print("VPN Gate 出口：%d 在线" % d["vpn_up"])
+    print("上次刷新：" + ("运行中…" if d.get("busy") else str(d.get("last_refresh") or "—")))
 except Exception:
     pass' 2>/dev/null
-    fi
-    echo -n "UI: "; ui_url
-    ;;
-  start|stop|restart)
-    c systemctl || { echo "需要 systemctl"; exit 1; }
-    systemctl "$1" "$SVC" && echo "✔ $1 完成"
-    ;;
-  logs)
-    shift || true
-    c journalctl || { echo "需要 journalctl"; exit 1; }
-    if [ "${1:-}" = "-f" ]; then journalctl -u "$SVC" -f --no-pager
-    else journalctl -u "$SVC" -n "${1:-50}" --no-pager; fi
-    ;;
-  api)
-    shift || true
-    api "${1:-/api/status}"
-    ;;
-  ui|url)
-    ui_url
-    ;;
-  key)
-    python3 -c "import json;print(json.load(open('$CONF'))['server']['api_key'])" 2>/dev/null || echo "(读取失败)"
-    ;;
-  update)
-    curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash
-    ;;
-  uninstall)
-    echo "确认卸载 resi-fanout？[y/N]"
-    read -r ans
-    [ "$ans" = "y" ] && curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/uninstall.sh | sudo bash
-    ;;
-  version|v)
-    "/opt/resi-fanout/bin/resi-fanout" version 2>/dev/null || echo "unknown"
-    ;;
-  *)
-    sed -n '3,12p' "$0"
-    ;;
+  fi
+  blue "UI 地址：$(ui_url 2>/dev/null)"
+}
+
+do_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    red  "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+    green "  Resi-Fanout 管理菜单 · 住宅代理扇出 → 3x-ui"
+    red  "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+    status_panel
+    red  "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+    green " 1. 服务状态总览（刷新）"
+    green " 2. 启动服务        3. 停止服务        4. 重启服务"
+    green " 5. 立即抓取并检测代理"
+    green " 6. 查看最近日志     7. 实时日志"
+    green " 8. 查看 UI 地址 / API Key"
+    green " 9. 更新 resi-fanout"
+    yellow " 10. 卸载"
+    red  " 0. 退出"
+    readp "请输入数字【0-10】：" choice
+    case "$choice" in
+      1) : ;;
+      2) svc_ctl start ;;
+      3) svc_ctl stop ;;
+      4) svc_ctl restart ;;
+      5) api /api/refresh >/dev/null 2>&1 && green "已触发抓取+检测（几分钟后看菜单统计）" || red "触发失败（服务未运行？）" ;;
+      6) c journalctl && journalctl -u "$SVC" -n 50 --no-pager || yellow "需要 journalctl" ;;
+      7) c journalctl && journalctl -u "$SVC" -f --no-pager || yellow "需要 journalctl" ;;
+      8) blue "UI：$(ui_url 2>/dev/null)"; blue "Key：$(python3 -c "import json;print(json.load(open('$CONF'))['server']['api_key'] or '（未设置）')" 2>/dev/null)" ;;
+      9) curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash ;;
+      10) readp "确认卸载？[y/N]：" yn
+          [ "$yn" = "y" ] && curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/uninstall.sh | sudo bash && exit 0 ;;
+      0|*) exit 0 ;;
+    esac
+    readp "按回车返回菜单…" _
+  done
+}
+
+do_logs() {
+  c journalctl || { yellow "需要 journalctl"; return 1; }
+  if [ "${1:-}" = "-f" ]; then journalctl -u "$SVC" -f --no-pager
+  else journalctl -u "$SVC" -n "${1:-50}" --no-pager; fi
+}
+
+do_update() {
+  curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash
+}
+
+do_uninstall() {
+  readp "确认卸载 resi-fanout？[y/N]：" yn
+  [ "$yn" = "y" ] && curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/uninstall.sh | sudo bash
+}
+
+case "${1:-}" in
+  ""|menu) do_menu ;;
+  status)  status_panel ;;
+  start|stop|restart) svc_ctl "$1" ;;
+  logs)    shift; do_logs "$@" ;;
+  api)     shift; api "${1:-/api/status}" ;;
+  ui|url)  ui_url ;;
+  key)     python3 -c "import json;print(json.load(open('$CONF'))['server']['api_key'] or '（未设置）')" 2>/dev/null ;;
+  update)  do_update ;;
+  uninstall) do_uninstall ;;
+  version) "/opt/resi-fanout/bin/resi-fanout" version 2>/dev/null || api /api/status 2>/dev/null | python3 -c 'import json,sys
+try: print("v" + json.load(sys.stdin)["version"])
+except Exception: print("unknown")' ;;
+  *) sed -n '3,10p' "$0" ;;
 esac
 RFEOF
 chmod +x /usr/local/bin/rf
@@ -503,7 +545,7 @@ cat <<EOF
   data   : ${DATA_DIR}
   logs   : journalctl -u ${SERVICE} -f
 
- 全局命令: rf（状态/启动/日志/更新，直接敲 rf 看帮助）
+ 管理菜单: 输入 rf 打开交互菜单（状态/启停/抓取/日志/更新/卸载）
 
  next steps:
   1. open the UI (port-forward via ssh -L ${API_PORT}:127.0.0.1:${API_PORT})
