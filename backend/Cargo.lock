@@ -1090,6 +1090,7 @@ dependencies = [
  "base64 0.22.1",
  "hyper",
  "hyper-util",
+ "libc",
  "reqwest",
  "rustls",
  "rustls-pemfile",

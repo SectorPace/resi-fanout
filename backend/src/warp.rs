@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -84,9 +85,9 @@ pub fn parse_profile(text: &str) -> WgProfile {
             ("interface", "mtu") => p.mtu = v.parse().unwrap_or(0),
             ("peer", "publickey") => p.public_key = v.to_string(),
             ("peer", "endpoint") => p.endpoint = v.to_string(),
-            ("peer", "allowedips") => {
-                p.allowed_ips.extend(v.split(',').map(|x| x.trim().to_string()))
-            }
+            ("peer", "allowedips") => p
+                .allowed_ips
+                .extend(v.split(',').map(|x| x.trim().to_string())),
             ("peer", "persistentkeepalive") => p.keepalive = v.parse().unwrap_or(0),
             _ => {}
         }
@@ -106,7 +107,11 @@ fn managed_conf(
 ) -> String {
     let up = Path::new(scripts_dir).join("warp-up.sh");
     let down = Path::new(scripts_dir).join("warp-down.sh");
-    let ka = if keepalive > 0 { keepalive } else { profile.keepalive };
+    let ka = if keepalive > 0 {
+        keepalive
+    } else {
+        profile.keepalive
+    };
     let m = if mtu > 0 { mtu } else { profile.mtu };
     let mut ips = profile.addresses.clone();
     if ips.is_empty() {
@@ -169,16 +174,17 @@ pub async fn status(state: &Arc<AppState>) -> WarpStatus {
         ..Default::default()
     };
     // classification cache written by the supervisor
-    if let Ok(text) = tokio::fs::read_to_string(
-        state.data_dir.join("warp").join("status.json"),
-    )
-    .await
+    if let Ok(text) =
+        tokio::fs::read_to_string(state.data_dir.join("warp").join("status.json")).await
     {
         if let Ok(v) = serde_json::from_str::<Value>(&text) {
             st.tun_ip = v.get("tun_ip").and_then(|x| x.as_str()).map(String::from);
             st.exit_ip = v.get("exit_ip").and_then(|x| x.as_str()).map(String::from);
             st.country = v.get("country").and_then(|x| x.as_str()).map(String::from);
-            st.country_code = v.get("country_code").and_then(|x| x.as_str()).map(String::from);
+            st.country_code = v
+                .get("country_code")
+                .and_then(|x| x.as_str())
+                .map(String::from);
             st.isp = v.get("isp").and_then(|x| x.as_str()).map(String::from);
             st.latency_ms = v.get("latency_ms").and_then(|x| x.as_u64());
             st.hosting = v.get("hosting").and_then(|x| x.as_bool());
@@ -197,6 +203,39 @@ async fn write_status(state: &Arc<AppState>, v: &Value) {
     let dir = state.data_dir.join("warp");
     let _ = tokio::fs::create_dir_all(&dir).await;
     let _ = tokio::fs::write(dir.join("status.json"), v.to_string()).await;
+}
+
+/// Write a file holding key material (a WireGuard **private** key) as
+/// owner-only. The data dir is 0755 and `tokio::fs::write` would leave every
+/// file at 0644, so any local account could read the tunnel credentials — even
+/// though install.sh carefully chmods config.json and privkey.pem. `mode()`
+/// only applies when the file is created, hence the explicit `set_permissions`
+/// afterwards: it also tightens a file an earlier build left loose.
+async fn write_secret(path: &Path, text: &str) -> Result<(), String> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = tokio::fs::OpenOptions::from(opts)
+        .open(path)
+        .await
+        .map_err(|e| e.to_string())?;
+    f.write_all(text.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    f.flush().await.map_err(|e| e.to_string())?;
+    drop(f);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 /// `wgcf register` (with license when configured), then adopt the profile.
@@ -224,13 +263,10 @@ pub async fn register(state: &Arc<AppState>, license: Option<String>) -> Result<
     if let Some(l) = &lic {
         cmd.arg("--license").arg(l);
     }
-    let out = tokio::time::timeout(
-        Duration::from_secs(60),
-        cmd.output(),
-    )
-    .await
-    .map_err(|_| "wgcf register timed out".to_string())?
-    .map_err(|e| e.to_string())?;
+    let out = tokio::time::timeout(Duration::from_secs(60), cmd.output())
+        .await
+        .map_err(|_| "wgcf register timed out".to_string())?
+        .map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(format!(
             "wgcf register failed: {}",
@@ -242,7 +278,12 @@ pub async fn register(state: &Arc<AppState>, license: Option<String>) -> Result<
         .await
         .map_err(|e| format!("profile not found after wgcf: {e}"))?;
     import_profile(state, &text).await?;
-    Ok(if lic.is_some() { "WARP+ profile registered" } else { "WARP profile registered" }.into())
+    Ok(if lic.is_some() {
+        "WARP+ profile registered"
+    } else {
+        "WARP profile registered"
+    }
+    .into())
 }
 
 /// Save a pasted WireGuard config as our profile.
@@ -258,7 +299,7 @@ pub async fn import_profile(state: &Arc<AppState>, text: &str) -> Result<WgProfi
             .await
             .map_err(|e| e.to_string())?;
     }
-    tokio::fs::write(&path, text).await.map_err(|e| e.to_string())?;
+    write_secret(&path, text).await?;
     info!(path = %cfg.warp.conf_path, endpoint = %p.endpoint, "warp profile imported");
     Ok(p)
 }
@@ -276,7 +317,9 @@ pub async fn connect(state: &Arc<AppState>) -> Result<(), String> {
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
-    tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| e.to_string())?;
     let managed = dir.join(format!("{}.managed.conf", cfg.warp.interface));
     let conf = managed_conf(
         &profile,
@@ -286,7 +329,7 @@ pub async fn connect(state: &Arc<AppState>) -> Result<(), String> {
         cfg.warp.mtu,
         cfg.warp.local_port,
     );
-    tokio::fs::write(&managed, conf).await.map_err(|e| e.to_string())?;
+    write_secret(&managed, &conf).await?;
 
     // tear down a stale interface first
     let _ = tokio::process::Command::new("wg-quick")
@@ -329,7 +372,11 @@ pub async fn run_cycle(state: &Arc<AppState>) {
         return;
     }
     if !tools().wg_quick {
-        write_status(state, &json!({ "error": "wg-quick not installed", "last_check": now_ts() })).await;
+        write_status(
+            state,
+            &json!({ "error": "wg-quick not installed", "last_check": now_ts() }),
+        )
+        .await;
         return;
     }
     if !interface_exists(&cfg.warp.interface).await {
@@ -341,7 +388,11 @@ pub async fn run_cycle(state: &Arc<AppState>) {
     // tunnel IP = first address of the interface
     let tun_ip = tun_ip_of(&cfg.warp.interface).await;
     let Some(ip) = tun_ip else {
-        write_status(state, &json!({ "error": "interface has no address", "last_check": now_ts() })).await;
+        write_status(
+            state,
+            &json!({ "error": "interface has no address", "last_check": now_ts() }),
+        )
+        .await;
         return;
     };
 
@@ -480,9 +531,11 @@ pub async fn apply_clash(
             let conf = clash_to_mihomo(node, cfg.warp.mihomo_port);
             let path = PathBuf::from(&cfg.warp.mihomo_conf);
             if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
-            tokio::fs::write(&path, conf).await.map_err(|e| e.to_string())?;
+            write_secret(&path, &conf).await?;
             // restart sidecar with the new node
             let taken = {
                 MASQUE_SLOT
@@ -586,7 +639,10 @@ fn der_candidates(buf: &[u8]) -> Vec<[u8; 32]> {
             if first & 0x80 != 0 {
                 let n = (first & 0x7f) as usize;
                 if n == 0 || n > 4 || p + n > end {
-                    break;
+                    // not a TLV we can read; the bytes after it may still hold
+                    // a key, so step over this one byte and keep scanning
+                    i += 1;
+                    continue;
                 }
                 let mut v: usize = 0;
                 for k in 0..n {
@@ -598,7 +654,8 @@ fn der_candidates(buf: &[u8]) -> Vec<[u8; 32]> {
                 len = first as usize;
             }
             if len > end - p {
-                break;
+                i += 1;
+                continue;
             }
             if len == 32 {
                 out.push(copy32(&buf[p..p + 32]));
@@ -629,14 +686,35 @@ pub fn normalize_key(b64: &str) -> Option<String> {
     }
     let cands = der_candidates(&raw);
     if cands.is_empty() {
-        warn!(raw_len = raw.len(), head = hex_head(&raw), "no 32-byte chunk found in key blob");
+        warn!(
+            raw_len = raw.len(),
+            head = hex_head(&raw),
+            "no 32-byte chunk found in key blob"
+        );
+        return None;
+    }
+    if cands.len() > 1 {
+        // Cloudflare hands out multi-algorithm containers (X25519 + X448 inside
+        // one PKCS#8 blob); handing out cands[0] would silently reduce the
+        // container to one arbitrary 32-byte chunk, which is exactly what the
+        // `wg_private_key` contract promises never happens.
+        warn!(
+            raw_len = raw.len(),
+            candidates = cands.len(),
+            head = hex_head(&raw),
+            "ambiguous key blob (multi-algorithm container) — not reduced to one chunk"
+        );
         return None;
     }
     Some(base64::engine::general_purpose::STANDARD.encode(cands[0]))
 }
 
 fn hex_head(raw: &[u8]) -> String {
-    raw.iter().take(20).map(|b| format!("{b:02x}")).collect::<Vec<_>>().join("")
+    raw.iter()
+        .take(20)
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 /// Extract the top-level `proxies:` block as text. Clash configs use YAML
@@ -690,7 +768,8 @@ pub fn parse_clash(yaml: &str) -> Vec<ClashNode> {
     // Clash writes `port: 443` / `mtu: 1280` as numbers, not strings
     let num = |m: &serde_yaml::Mapping, k: &str| -> Option<u64> {
         let v = m.get(serde_yaml::Value::String(k.into()))?;
-        v.as_u64().or_else(|| v.as_str().and_then(|x| x.parse().ok()))
+        v.as_u64()
+            .or_else(|| v.as_str().and_then(|x| x.parse().ok()))
     };
     let mut out = Vec::new();
     for p in proxies {
@@ -699,8 +778,12 @@ pub fn parse_clash(yaml: &str) -> Vec<ClashNode> {
         if kind != "masque" && kind != "wireguard" {
             continue;
         }
-        let Some(priv_raw) = s(m, "private-key") else { continue };
-        let Some(pub_raw) = s(m, "public-key") else { continue };
+        let Some(priv_raw) = s(m, "private-key") else {
+            continue;
+        };
+        let Some(pub_raw) = s(m, "public-key") else {
+            continue;
+        };
         // MASQUE keys are Cloudflare multi-algorithm containers (X25519+X448)
         // that only Mihomo can consume; keep them verbatim and mark whether a
         // plain-wireguard extraction was unambiguous.
@@ -838,7 +921,11 @@ pub fn supervisor(state: Arc<AppState>) {
                 };
                 (alive, cfg.warp.mihomo_port)
             };
-            if tokio::fs::metadata(&cfg.warp.mihomo_conf).await.map(|m| m.len() > 0).unwrap_or(false) {
+            if tokio::fs::metadata(&cfg.warp.mihomo_conf)
+                .await
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+            {
                 if !alive {
                     match start_masque(&cfg, state.clone()).await {
                         Ok(()) => info!("masque sidecar started"),
@@ -859,12 +946,17 @@ async fn start_masque(cfg: &crate::config::Config, state: Arc<AppState>) -> Resu
     }
     let conf = PathBuf::from(&cfg.warp.mihomo_conf);
     if let Some(parent) = conf.parent() {
-        tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     let child = Command::new(&cfg.warp.mihomo_bin)
         .args([
             "-d",
-            conf.parent().unwrap_or(Path::new(".")).to_string_lossy().as_ref(),
+            conf.parent()
+                .unwrap_or(Path::new("."))
+                .to_string_lossy()
+                .as_ref(),
             "-f",
             conf.to_string_lossy().as_ref(),
         ])
@@ -894,7 +986,11 @@ async fn ensure_proxy_listener(state: &Arc<AppState>, port: u16) {
     static PROXY_LISTENERS: std::sync::OnceLock<std::sync::Mutex<Vec<u16>>> =
         std::sync::OnceLock::new();
     let set = PROXY_LISTENERS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
-    if set.lock().unwrap_or_else(|e| e.into_inner()).contains(&port) {
+    if set
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&port)
+    {
         return;
     }
     let st = state.clone();
@@ -919,7 +1015,9 @@ async fn ensure_proxy_listener(state: &Arc<AppState>, port: u16) {
 async fn classify_masque(state: &Arc<AppState>, port: u16) {
     let cfg = state.config().await;
     // throttle: only re-classify every 10 minutes
-    if let Ok(text) = tokio::fs::read_to_string(state.data_dir.join("warp").join("masque.json")).await {
+    if let Ok(text) =
+        tokio::fs::read_to_string(state.data_dir.join("warp").join("masque.json")).await
+    {
         if let Ok(v) = serde_json::from_str::<Value>(&text) {
             if let Some(ts) = v.get("last_check").and_then(|x| x.as_i64()) {
                 if now_ts() - ts < 600 {
@@ -970,5 +1068,26 @@ mod tests {
             normalize_key("5MNnY76OiMX+L6CzAcRlbxFUthDxisBwow45LL43PgM=").as_deref(),
             Some("5MNnY76OiMX+L6CzAcRlbxFUthDxisBwow45LL43PgM=")
         );
+    }
+
+    /// A SEQUENCE holding a single OCTET STRING(32) is the plain-wireguard
+    /// shape and must still resolve; adding a second one makes the blob a
+    /// multi-algorithm container, which must be refused.
+    #[test]
+    fn refuses_ambiguous_key_blobs() {
+        use base64::Engine as _;
+        let der = |count: usize| {
+            let mut buf = vec![0x30, (count * 34) as u8];
+            for n in 0..count {
+                buf.push(0x04);
+                buf.push(0x20);
+                for i in 0..32u8 {
+                    buf.push((n * 32 + i as usize) as u8);
+                }
+            }
+            base64::engine::general_purpose::STANDARD.encode(&buf)
+        };
+        assert!(normalize_key(&der(1)).is_some());
+        assert_eq!(normalize_key(&der(2)), None);
     }
 }

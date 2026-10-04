@@ -37,6 +37,97 @@ warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 green() { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# ------------------------------------------------------------------ downloads
+# fetch_verify <url> <dest> <label> <mode:plain|gz|tar> [expected-sha]
+#
+# Fetch a remote artifact and install it, verifying sha256 whenever a checksum
+# is obtainable. The release tarball is always verified (and aborts on
+# mismatch); the optional third-party binaries used to be piped straight into
+# /usr/local/bin with no integrity check at all, which is inconsistent with
+# this script's own supply-chain claim for its own artifact — especially since
+# it runs as root from `curl | sudo bash`.
+#
+# A checksum is taken from, in order: the explicit argument, the operator-pinned
+# env var named by the label (e.g. LEGO_SHA256), or a `.sha256` / `.sha256sum`
+# sidecar next to the download. When none exists we say so explicitly instead of
+# pretending the transfer was verified.
+fetch_verify() {
+  local url="$1" dest="$2" label="$3" mode="${4:-plain}" want="${5:-}"
+  local base; base="$(basename "$dest")"
+  local raw="${TMPROOT}/fetch.$$.${base}"
+  local plain="${raw}.out"
+  local sum="${raw}.sum"
+  local src=""
+
+  if [ -z "${want}" ]; then
+    local var="${label}"
+    var="$(printf '%s' "$var" | tr 'a-z-' 'A-Z_')_SHA256"
+    want="${!var:-}"
+  fi
+  if [ -z "${want}" ]; then
+    local suffix
+    for suffix in .sha256 .sha256sum; do
+      if curl -fsSL --max-time 20 "${url}${suffix}" -o "${sum}" 2>/dev/null; then
+        # Do NOT gsub() on $i directly: assigning to a field makes awk re-split
+        # the record and resets the loop, so even the plain "hash  name" form
+        # failed to match. Work on a copy instead, and tolerate both the text
+        # ("hash  name") and binary ("hash *name") sha256sum output as well as
+        # an absolute path in the name field.
+        want="$(awk -v f="${base}" '
+          { for (i = 2; i <= NF; i++) { t = $i; sub(/^\*/, "", t);
+              n = t; sub(/^.*\//, "", n);
+              if (n == f) { print $1; exit } } }' "${sum}")"
+        [ -n "${want}" ] && break
+      fi
+    done
+  fi
+
+  if ! curl -fsSL --max-time 300 "${url}" -o "${raw}"; then
+    rm -f "${raw}" "${plain}" "${sum}"; return 1
+  fi
+  [ -s "${raw}" ] || { rm -f "${raw}" "${plain}" "${sum}"; return 1; }
+
+  if [ -n "${want}" ]; then
+    local got; got="$(sha256sum "${raw}" | awk '{print $1}')"
+    if [ "${got}" != "${want}" ]; then
+      rm -f "${raw}" "${plain}" "${sum}"
+      warn "${label} sha256 校验失败（期望 ${want} / 实际 ${got}）—— 已放弃安装"
+      return 1
+    fi
+    green "${label} sha256 校验通过"
+  else
+    warn "${label} 没有可用的 sha256（发布方未提供校验文件，也未设置对应 *_SHA256 环境变量）"
+    warn "        ${label} 仅通过 HTTPS 获取，未做完整性校验"
+  fi
+
+  case "${mode}" in
+    gz)
+      gzip -dc "${raw}" > "${plain}" 2>/dev/null || { rm -f "${raw}" "${plain}" "${sum}"; return 1; }
+      src="${plain}"
+      ;;
+    tar)
+      # release tarballs usually nest the binary one directory deep (lego/lego)
+      mkdir -p "${plain}" || { rm -rf "${raw}" "${plain}" "${sum}"; return 1; }
+      tar xzf "${raw}" -C "${plain}" 2>/dev/null || { rm -rf "${raw}" "${plain}" "${sum}"; return 1; }
+      src=""
+      if [ -f "${plain}/${base}" ]; then
+        src="${plain}/${base}"
+      else
+        src="$(find "${plain}" -type f -name "${base}" 2>/dev/null | head -1)"
+      fi
+      [ -n "${src}" ] && [ -f "${src}" ] || { rm -rf "${raw}" "${plain}" "${sum}"; return 1; }
+      ;;
+    *)
+      cp -f "${raw}" "${plain}"
+      src="${plain}"
+      ;;
+  esac
+  [ -s "${src}" ] || { rm -rf "${raw}" "${plain}" "${sum}"; return 1; }
+
+  install -m 755 "${src}" "${dest}"
+  rm -rf "${raw}" "${plain}" "${sum}"
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --port)       API_PORT="${2:?}"; shift 2 ;;
@@ -51,7 +142,34 @@ while [ $# -gt 0 ]; do
     --no-frontend) NO_FRONTEND="1"; shift ;;
     --skip-checksum) SKIP_CHECKSUM="1"; shift ;;
     -h|--help)
-      sed -n '2,12p' "$0"; exit 0 ;;
+      # `sed -n '2,12p' "$0"` printed nothing in the documented
+      # `curl … | sudo bash -s -- --help` invocation, because there $0 is the
+      # shell rather than this script. Fall back to an inline usage block.
+      if [ -r "$0" ] && grep -q 'resi-fanout installer' "$0" 2>/dev/null; then
+        sed -n '2,12p' "$0"
+      else
+        cat <<'USAGE'
+resi-fanout installer for Linux (Debian/Ubuntu/CentOS/Arch).
+
+Usage:
+  sudo bash install.sh [options]
+  curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash
+
+Options:
+  --port N          API/UI 端口（默认 7654）
+  --repo URL        指定仓库地址
+  --with-3xui       装完自动把出站推进本机 3x-ui
+  --with-vpngate    安装 openvpn 并启用 VPN Gate 隧道
+  --with-warp       安装 wireguard-tools 并启用 Cloudflare WARP
+  --with-masque     下载 mihomo（原生 MASQUE 支持）
+  --with-tls        签发 ACME IP 证书并开公网 HTTPS（默认）
+  --no-tls          不签证书，仅本机 HTTP
+  --from-source     强制源码编译（预编译包要求 glibc >= 2.35）
+  --no-frontend     跳过 npm 构建（用仓库自带 dist）
+  --skip-checksum   预编译包 sha256 校验失败时仍继续安装
+USAGE
+      fi
+      exit 0 ;;
     *) die "unknown option: $1 (see --help)" ;;
   esac
 done
@@ -181,12 +299,11 @@ if [ "${WITH_WARP}" = "1" ]; then
       aarch64|arm64) WGURL="https://github.com/ViRb3/wgcf/releases/latest/download/wgcf_2.2.22_linux_arm64" ;;
       *)             WGURL="" ;;
     esac
-    TMPB="${TMPROOT}/wgcf.bin"
-    if [ -n "${WGURL}" ] && curl -fsSL "${WGURL}" -o "${TMPB}" && [ -s "${TMPB}" ]; then
-      install -m 755 "${TMPB}" /usr/local/bin/wgcf
+    if [ -n "${WGURL}" ] && fetch_verify "${WGURL}" /usr/local/bin/wgcf "wgcf" plain "${WGCF_SHA256:-}"; then
+      green "wgcf 已安装：/usr/local/bin/wgcf"
     else
       rm -f /usr/local/bin/wgcf
-      warn "wgcf download skipped — you can still paste a WireGuard config in the UI"
+      warn "wgcf 下载/校验跳过 —— 你仍可在 UI 里粘贴 WireGuard 配置"
     fi
   fi
 fi
@@ -211,12 +328,11 @@ if [ "${WITH_MASQUE}" = "1" ]; then
     aarch64|arm64) MURL="https://github.com/MetaCubeX/mihomo/releases/latest/download/mihomo-linux-arm64-v1.19.12.gz" ;;
     *)             MURL="" ;;
   esac
-  TMPB="${TMPROOT}/mihomo.bin"
-  if [ -n "${MURL}" ] && curl -fsSL "${MURL}" | gzip -dc > "${TMPB}" 2>/dev/null && [ -s "${TMPB}" ]; then
-    install -m 755 "${TMPB}" /usr/local/bin/mihomo
+  if [ -n "${MURL}" ] && fetch_verify "${MURL}" /usr/local/bin/mihomo "mihomo" gz "${MIHOMO_SHA256:-}"; then
+    green "mihomo 已安装：/usr/local/bin/mihomo"
   else
     rm -f /usr/local/bin/mihomo
-    warn "mihomo download failed — MASQUE nodes can still be imported, just run mihomo manually"
+    warn "mihomo 下载/校验失败 —— MASQUE 节点仍可导入，只是需要你手动跑 mihomo"
   fi
 fi
 
@@ -240,11 +356,13 @@ try_issue_cert() {
       aarch64|arm64) LEGO_URL="https://github.com/go-acme/lego/releases/download/v5.5.2/lego_v5.5.2_linux_arm64.tar.gz" ;;
       *) warn "该架构没有 lego 预编译包"; return 1 ;;
     esac
+    # the tarball holds lego/ inside; extract, then install just the binary
     T="${TMPROOT}/lego"; mkdir -p "$T"
-    if curl -fsSL "${LEGO_URL}" | tar xz -C "${T}" && [ -f "${T}/lego" ]; then
-      install -m 755 "${T}/lego" /usr/local/bin/lego
+    LEGO_BIN="${T}/lego"
+    if fetch_verify "${LEGO_URL}" "${LEGO_BIN}" "lego" tar "${LEGO_SHA256:-}"; then
+      green "lego 已安装：/usr/local/bin/lego"
     else
-      warn "lego 下载失败（404/网络）。手动安装：
+      warn "lego 下载/校验失败（404/网络）。手动安装：
       curl -fsSL ${LEGO_URL} | tar xz -C /usr/local/bin && chmod +x /usr/local/bin/lego"
       return 1
     fi
@@ -365,10 +483,17 @@ if [ "${PREBUILT:-0}" != "1" ]; then
     log "installing Node.js (needed to build the web UI)"
     case "$PKG" in
       apt-get)
-        curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1 || true
+        # NOTE: the NodeSource setup script is remote code executed as root and
+        # cannot be checksum-verified here. It is a well-known upstream, but be
+        # aware that --from-source / a preinstalled npm avoids this path.
+        if ! curl -fsSL --max-time 120 https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1; then
+          warn "NodeSource setup 脚本执行失败 —— 继续尝试用系统包安装 nodejs"
+        fi
         install_pkgs nodejs || build_frontend="0" ;;
       dnf|yum)
-        curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >/dev/null 2>&1 || true
+        if ! curl -fsSL --max-time 120 https://rpm.nodesource.com/setup_20.x | bash - >/dev/null 2>&1; then
+          warn "NodeSource setup 脚本执行失败 —— 继续尝试用系统包安装 nodejs"
+        fi
         install_pkgs nodejs || build_frontend="0" ;;
       pacman) install_pkgs nodejs npm || build_frontend="0" ;;
       *) build_frontend="0" ;;
@@ -471,6 +596,25 @@ c["server"]["base_path"] = base
 c["server"]["listen"] = f"0.0.0.0:{port}"
 json.dump(c, open(cfg_path, "w"), indent=2, ensure_ascii=False)
 PYEOF2
+else
+  # --no-tls (or a cert failure) on a host that was previously installed with
+  # public HTTPS: without this the old config survived untouched, so the service
+  # kept listening on 0.0.0.0 with tls.enabled=true — the exact exposure the
+  # flag promises to remove — and the summary below then printed a misleading
+  # `http://` URL for what was really still an HTTPS listener.
+  PREV_TLS="$(python3 -c "import json;print(json.load(open('${CONF_DIR}/config.json'))['server'].get('tls',{}).get('enabled',False))" 2>/dev/null || echo False)"
+  if [ "${PREV_TLS}" = "True" ]; then
+    python3 - "${CONF_DIR}/config.json" "${API_PORT}" <<'PYEOF3'
+import json, sys
+cfg_path, port = sys.argv[1], sys.argv[2]
+c = json.load(open(cfg_path))
+c["server"]["tls"] = {"enabled": False}
+c["server"]["base_path"] = ""
+c["server"]["listen"] = f"127.0.0.1:{port}"
+json.dump(c, open(cfg_path, "w"), indent=2, ensure_ascii=False)
+PYEOF3
+    log "已按 --no-tls 关闭 HTTPS：监听回退到 127.0.0.1:${API_PORT}，base_path 已清空"
+  fi
 fi
 
 # 权限修正（无条件执行）：配置与证书必须对服务账号可读，
@@ -661,10 +805,16 @@ do_doctor() {
     else red "   服务账号读不到 privkey.pem ✗ → sudo chown root:$SVC $tlsdir/privkey.pem"; fi
   else yellow "   无证书目录（纯 HTTP 部署可忽略）"; fi
   yellow "7) 数据目录"
-  if c runuser && runuser -u "$SVC" -- touch "$(python3 -c "import json;print(json.load(open('$CONF'))['server']['web_root'])" 2>/dev/null)/../.probe" 2>/dev/null; then
-    blue "   可写 ✓"
+  # Probe the data directory itself. This used to touch "<web_root>/../.probe",
+  # i.e. /opt/resi-fanout (root-owned, so always unwritable) while the failure
+  # message told the operator to chown /var/lib/resi-fanout — wrong directory
+  # tested, wrong remedy suggested — and it left a .probe file behind.
+  local datadir="/var/lib/${SVC}"
+  if c runuser && runuser -u "$SVC" -- touch "${datadir}/.probe" 2>/dev/null; then
+    rm -f "${datadir}/.probe"
+    blue "   可写 ✓ (${datadir})"
   else
-    red "   服务账号不可写 ✗ → sudo chown -R $SVC:/var/lib/${SVC%%.*}"
+    red "   服务账号不可写 ✗ → sudo chown -R ${SVC}:${SVC} ${datadir}"
   fi
   if c journalctl; then
     yellow "8) 最近错误"

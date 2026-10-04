@@ -3,11 +3,14 @@
 //! through the upstream proxy — the same idea as `gost -L :PORT -F upstream`.
 
 use std::collections::{HashMap, HashSet};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -18,6 +21,19 @@ use crate::state::AppState;
 
 const UPSTREAM_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 const HEAD_MAX: usize = 16 * 1024;
+/// Everything from `accept` to "upstream connected" must finish within this.
+/// Without it a client that connects and sends nothing (or a byte or two) pins
+/// a task *and* a file descriptor for good; a handful per port is enough to hit
+/// the fd limit, after which `accept` fails and the whole fanout for that port
+/// dies.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// An established session that moves no bytes for this long is dropped.
+const RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// How often the relay above re-checks for idleness.
+const RELAY_IDLE_CHECK: Duration = Duration::from_secs(15);
+/// Longest target host we accept. SOCKS5 frames a domain as a single length
+/// byte (see `socks5_dial`), and a real name is at most 253 bytes anyway.
+const MAX_HOST_LEN: usize = 255;
 
 /// How to reach the internet for one fanout port:
 /// through an upstream proxy (free/paid lists) or out of a local
@@ -29,10 +45,31 @@ pub enum Dialer {
 }
 
 async fn dial(dialer: &Dialer, host: &str, port: u16) -> Result<TcpStream> {
+    check_host(host)?;
     match dialer {
         Dialer::Proxy(key) => dial_upstream(key, host, port).await,
         Dialer::Tun(ip) => dial_from_ip(*ip, host, port).await,
     }
+}
+
+/// Reject a target host we could not frame correctly downstream. The host can
+/// come straight out of a client-controlled `Host:` header, and an over-long or
+/// non-ASCII name would truncate the SOCKS5 length byte (desynchronising the
+/// upstream proxy's framing) or inject into an HTTP `CONNECT` request line.
+fn check_host(host: &str) -> Result<()> {
+    if host.is_empty() {
+        bail!("empty target host");
+    }
+    if host.len() > MAX_HOST_LEN {
+        bail!(
+            "target host is {} bytes, over the {MAX_HOST_LEN} byte limit",
+            host.len()
+        );
+    }
+    if !host.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+        bail!("target host is not printable ascii");
+    }
+    Ok(())
 }
 
 /// Connect to host:port with the socket bound to `local` (the tunnel IP).
@@ -75,7 +112,12 @@ async fn resolve_same_family(
             _ => fallback = Some(a),
         }
     }
-    fallback.ok_or_else(|| anyhow!("no {family} address for {host}", family = if want_v4 { "IPv4" } else { "IPv6" }))
+    fallback.ok_or_else(|| {
+        anyhow!(
+            "no {family} address for {host}",
+            family = if want_v4 { "IPv4" } else { "IPv6" }
+        )
+    })
 }
 
 /// Periodically recompute which local ports should be listening and
@@ -92,7 +134,9 @@ pub fn spawn_supervisor(state: Arc<AppState>) {
             tick.tick().await;
             let cfg = state.config().await;
 
-            if last_mode.is_some() && (cfg.fanout.bind != last_bind || Some(cfg.fanout.mode) != last_mode) {
+            if last_mode.is_some()
+                && (cfg.fanout.bind != last_bind || Some(cfg.fanout.mode) != last_mode)
+            {
                 for (_, h) in running.drain() {
                     h.abort();
                 }
@@ -204,25 +248,147 @@ async fn run_listener_inner(
     }
 }
 
-async fn handle_local(mode: FanoutMode, mut sock: TcpStream, dialer: &Dialer) -> Result<()> {
+/// Serve one accepted connection: the local handshake plus the upstream
+/// connect must complete within [`HANDSHAKE_TIMEOUT`], after which the two
+/// sockets are relayed until they close or the session goes idle.
+async fn handle_local(mode: FanoutMode, sock: TcpStream, dialer: &Dialer) -> Result<()> {
+    let established = tokio::time::timeout(HANDSHAKE_TIMEOUT, establish(mode, sock, dialer))
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "handshake not completed within {}s",
+                HANDSHAKE_TIMEOUT.as_secs()
+            )
+        })?;
+    let (mut sock, mut up) = established?;
+    relay_session(&mut sock, &mut up).await
+}
+
+/// Protocol negotiation on the local socket and the connection to the
+/// upstream. Returns both streams, ready to be relayed.
+async fn establish(
+    mode: FanoutMode,
+    sock: TcpStream,
+    dialer: &Dialer,
+) -> Result<(TcpStream, TcpStream)> {
     match mode {
-        FanoutMode::Socks => serve_socks5(&mut sock, dialer).await,
-        FanoutMode::Http => serve_http(&mut sock, dialer).await,
+        FanoutMode::Socks => serve_socks5(sock, dialer).await,
+        FanoutMode::Http => serve_http(sock, dialer).await,
         FanoutMode::Mixed => {
+            // blocks until the peer sends its first byte, hence inside the
+            // handshake timeout
             let mut b = [0u8; 1];
             let n = sock.peek(&mut b).await?;
             if n > 0 && b[0] == 0x05 {
-                serve_socks5(&mut sock, dialer).await
+                serve_socks5(sock, dialer).await
             } else {
-                serve_http(&mut sock, dialer).await
+                serve_http(sock, dialer).await
             }
         }
     }
 }
 
+/// Copy both directions until a side closes, a copy fails, or nothing moves
+/// for [`RELAY_IDLE_TIMEOUT`]. A peer that stops talking would otherwise hold
+/// the task and the descriptor for as long as it keeps the socket open.
+async fn relay_session(sock: &mut TcpStream, up: &mut TcpStream) -> Result<()> {
+    let last = Arc::new(AtomicU64::new(now_ms()));
+    let mut local = IdleWatch::new(sock, last.clone());
+    let mut remote = IdleWatch::new(up, last.clone());
+    let copy = tokio::io::copy_bidirectional(&mut local, &mut remote);
+    tokio::pin!(copy);
+
+    let mut check = tokio::time::interval(RELAY_IDLE_CHECK);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    check.tick().await; // the first tick is immediate, skip it
+    loop {
+        tokio::select! {
+            res = &mut copy => return res.map(|_| ()).map_err(anyhow::Error::from),
+            _ = check.tick() => {
+                let idle = Duration::from_millis(now_ms().saturating_sub(last.load(Ordering::Relaxed)));
+                if idle >= RELAY_IDLE_TIMEOUT {
+                    debug!(idle_s = idle.as_secs(), "relay session idle, closing");
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Records the last moment a stream moved bytes, so `relay_session` can tell an
+/// active tunnel from a dead one that is merely still connected.
+struct IdleWatch<'a, T> {
+    inner: &'a mut T,
+    last: Arc<AtomicU64>,
+}
+
+impl<'a, T> IdleWatch<'a, T> {
+    fn new(inner: &'a mut T, last: Arc<AtomicU64>) -> Self {
+        Self { inner, last }
+    }
+
+    fn touch(&self) {
+        self.last.store(now_ms(), Ordering::Relaxed);
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for IdleWatch<'_, T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.as_mut().get_mut();
+        let before = buf.filled().len();
+        match Pin::new(&mut *this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if buf.filled().len() > before {
+                    this.touch();
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
+        }
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for IdleWatch<'_, T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.as_mut().get_mut();
+        match Pin::new(&mut *this.inner).poll_write(cx, buf) {
+            Poll::Ready(Ok(n)) => {
+                if n > 0 {
+                    this.touch();
+                }
+                Poll::Ready(Ok(n))
+            }
+            other => other,
+        }
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.as_mut().get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut *self.as_mut().get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 // ---------------------------------------------------------------- local SOCKS5
 
-async fn serve_socks5(sock: &mut TcpStream, dialer: &Dialer) -> Result<()> {
+async fn serve_socks5(mut sock: TcpStream, dialer: &Dialer) -> Result<(TcpStream, TcpStream)> {
     let mut hdr = [0u8; 2];
     sock.read_exact(&mut hdr).await?;
     if hdr[0] != 0x05 {
@@ -243,15 +409,16 @@ async fn serve_socks5(sock: &mut TcpStream, dialer: &Dialer) -> Result<()> {
         bail!("bad socks version in request");
     }
     if req[1] != 0x01 {
-        sock.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+        sock.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
         bail!("only CONNECT is supported");
     }
-    let (host, port) = read_socks_target(sock, req[3]).await?;
+    let (host, port) = read_socks_target(&mut sock, req[3]).await?;
 
-    let mut up = dial(dialer, &host, port).await?;
-    sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-    tokio::io::copy_bidirectional(sock, &mut up).await?;
-    Ok(())
+    let up = dial(dialer, &host, port).await?;
+    sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
+    Ok((sock, up))
 }
 
 async fn read_socks_target(sock: &mut TcpStream, atyp: u8) -> Result<(String, u16)> {
@@ -282,8 +449,8 @@ async fn read_socks_target(sock: &mut TcpStream, atyp: u8) -> Result<(String, u1
 
 // ---------------------------------------------------------------- local HTTP
 
-async fn serve_http(sock: &mut TcpStream, dialer: &Dialer) -> Result<()> {
-    let head = read_head(sock, HEAD_MAX).await?;
+async fn serve_http(mut sock: TcpStream, dialer: &Dialer) -> Result<(TcpStream, TcpStream)> {
+    let head = read_head(&mut sock, HEAD_MAX).await?;
     let text = String::from_utf8_lossy(&head);
     let reqline = text.lines().next().unwrap_or("");
     let mut parts = reqline.split_whitespace();
@@ -295,18 +462,18 @@ async fn serve_http(sock: &mut TcpStream, dialer: &Dialer) -> Result<()> {
 
     if method == "CONNECT" {
         let (host, port) = parse_authority(&target).ok_or_else(|| anyhow!("bad CONNECT target"))?;
-        let mut up = dial(dialer, &host, port).await?;
-        sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").await?;
-        tokio::io::copy_bidirectional(sock, &mut up).await?;
+        let up = dial(dialer, &host, port).await?;
+        sock.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await?;
+        Ok((sock, up))
     } else {
         // Plain request: open a CONNECT tunnel to the origin, then forward
         // the request bytes untouched.
         let (host, port) = host_from_head(&head, &target)?;
         let mut up = dial(dialer, &host, port).await?;
         up.write_all(&head).await?;
-        tokio::io::copy_bidirectional(sock, &mut up).await?;
+        Ok((sock, up))
     }
-    Ok(())
 }
 
 async fn read_head(sock: &mut TcpStream, cap: usize) -> Result<Vec<u8>> {
@@ -383,7 +550,12 @@ async fn dial_upstream(key: &str, host: &str, port: u16) -> Result<TcpStream> {
 }
 
 /// SOCKS5 client handshake: CONNECT via no-auth.
-pub async fn socks5_dial(proxy_host: &str, proxy_port: u16, host: &str, port: u16) -> Result<TcpStream> {
+pub async fn socks5_dial(
+    proxy_host: &str,
+    proxy_port: u16,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream> {
     let mut s = TcpStream::connect((proxy_host, proxy_port)).await?;
     s.set_nodelay(true).ok();
     s.write_all(&[0x05, 0x01, 0x00]).await?;
@@ -400,6 +572,10 @@ pub async fn socks5_dial(proxy_host: &str, proxy_port: u16, host: &str, port: u1
         req.push(0x04);
         req.extend_from_slice(&v6.octets());
     } else {
+        // a domain is length-prefixed with a single byte: refuse anything that
+        // would not survive `host.len() as u8` instead of truncating the
+        // declared length and shipping a longer payload behind it
+        check_host(host)?;
         req.push(0x03);
         req.push(host.len() as u8);
         req.extend_from_slice(host.as_bytes());
@@ -427,7 +603,12 @@ pub async fn socks5_dial(proxy_host: &str, proxy_port: u16, host: &str, port: u1
 }
 
 /// SOCKS4 client handshake (target resolved locally to IPv4 first).
-pub async fn socks4_dial(proxy_host: &str, proxy_port: u16, host: &str, port: u16) -> Result<TcpStream> {
+pub async fn socks4_dial(
+    proxy_host: &str,
+    proxy_port: u16,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream> {
     let ip = resolve_v4(host).await?;
     let mut s = TcpStream::connect((proxy_host, proxy_port)).await?;
     s.set_nodelay(true).ok();
@@ -445,7 +626,12 @@ pub async fn socks4_dial(proxy_host: &str, proxy_port: u16, host: &str, port: u1
 }
 
 /// HTTP proxy: open a CONNECT tunnel to host:port.
-pub async fn http_dial(proxy_host: &str, proxy_port: u16, host: &str, port: u16) -> Result<TcpStream> {
+pub async fn http_dial(
+    proxy_host: &str,
+    proxy_port: u16,
+    host: &str,
+    port: u16,
+) -> Result<TcpStream> {
     let mut s = TcpStream::connect((proxy_host, proxy_port)).await?;
     s.set_nodelay(true).ok();
     let req = format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: Mozilla/5.0 resi-fanout\r\n\r\n");

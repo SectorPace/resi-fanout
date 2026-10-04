@@ -10,6 +10,28 @@ use crate::models::now_ts;
 use crate::sources;
 use crate::state::AppState;
 
+/// Releases `AppState::busy` when dropped, including while unwinding.
+///
+/// A cycle runs inside a detached `tokio::spawn`, so a panic anywhere in the
+/// body kills only that task. With `busy` merely cleared on the straight-line
+/// success path, such a panic left the flag set forever: every
+/// `POST /api/refresh` and `POST /api/check` then answered 409, and the
+/// periodic loop's `!state.busy.swap(true, ..)` never fired again — the
+/// service stopped refreshing until an operator restarted it.
+struct BusyGuard(Arc<AppState>);
+
+impl BusyGuard {
+    fn new(state: &Arc<AppState>) -> Self {
+        Self(state.clone())
+    }
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::SeqCst);
+    }
+}
+
 pub fn spawn(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(10));
@@ -18,13 +40,18 @@ pub fn spawn(state: Arc<AppState>) {
             tick.tick().await;
             // a check round dirties the state constantly; with a few thousand
             // proxies every write is megabytes, so keep a floor between saves
-            // (run_cycle still forces a save when it finishes)
-            if state.dirty.swap(false, Ordering::Relaxed)
-                && last_save.elapsed() >= Duration::from_secs(30)
+            // (run_cycle still forces a save when it finishes).
+            // `dirty` is only consumed once a save actually succeeded: clearing
+            // it up front dropped the pending change whenever save_state()
+            // failed (full disk, EACCES) with nothing left to retry from.
+            if last_save.elapsed() >= Duration::from_secs(30) && state.dirty.load(Ordering::Relaxed)
             {
                 match state.save_state().await {
-                    Ok(()) => last_save = std::time::Instant::now(),
-                    Err(e) => warn!(error = %e, "state save failed"),
+                    Ok(()) => {
+                        state.dirty.store(false, Ordering::Relaxed);
+                        last_save = std::time::Instant::now();
+                    }
+                    Err(e) => warn!(error = %e, "state save failed, keeping dirty flag to retry"),
                 }
             }
             let cfg = state.config().await;
@@ -61,6 +88,9 @@ pub fn spawn(state: Arc<AppState>) {
 /// One full cycle: prune → fetch sources → merge → health-check →
 /// assign fanout ports → persist. Also used by POST /api/refresh.
 pub async fn run_cycle(state: &Arc<AppState>) {
+    // Claim nothing (the caller does that atomically) but guarantee release on
+    // every exit path, including an unwind.
+    let _busy = BusyGuard::new(state);
     let cfg = state.config().await;
 
     let pruned = state.prune(cfg.scheduler.prune_days).await;
@@ -74,7 +104,33 @@ pub async fn run_cycle(state: &Arc<AppState>) {
     }
 
     // 1) fetch all enabled sources concurrently
-    let client = sources::build_client();
+    let client = match sources::build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            // Not fatal: keep the existing pool and try again next cycle.
+            warn!(error = %e, "cannot build http client, skipping source fetch");
+            *state.source_status.write().await = cfg
+                .sources
+                .iter()
+                .filter(|s| s.enabled)
+                .map(|s| crate::models::SourceStatus {
+                    name: s.name.clone(),
+                    ok: false,
+                    count: 0,
+                    error: Some(format!("http client unavailable: {e}")),
+                    ts: now_ts(),
+                })
+                .collect();
+            state.assign_ports().await;
+            let now = now_ts();
+            *state.last_refresh.write().await = Some(now);
+            *state.next_refresh.write().await =
+                Some(now + (cfg.scheduler.refresh_minutes as i64) * 60);
+            state.dirty.store(true, Ordering::Relaxed);
+            let _ = state.save_state().await;
+            return;
+        }
+    };
     let mut outcomes = sources::fetch_all(&client, &cfg.sources).await;
 
     let mut statuses = Vec::new();
@@ -166,6 +222,7 @@ pub async fn run_cycle(state: &Arc<AppState>) {
     *state.last_check_all.write().await = Some(now);
     state.dirty.store(true, Ordering::Relaxed);
     let _ = state.save_state().await;
-    state.busy.store(false, Ordering::SeqCst);
+    // `busy` is released by BusyGuard on drop, so a panic above cannot wedge
+    // the scheduler.
     info!("refresh cycle done");
 }

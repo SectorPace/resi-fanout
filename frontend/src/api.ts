@@ -169,7 +169,9 @@ const BASE_PATH = (() => {
   if (last.includes(".")) {
     p = p.slice(0, p.lastIndexOf("/"));
   }
-  return p === "/" ? "" : p;
+  // 上面的 replace 已把 "/foo/" 收成 "/foo"、把 "/" 收成 ""，
+  // 所以这里直接返回即可，不再需要 p === "/" 的兜底
+  return p;
 })();
 
 const url = (path: string): string => `${BASE_PATH}${path}`;
@@ -181,7 +183,7 @@ export function setKey(k: string): void {
   localStorage.setItem(KEY_STORE, k);
 }
 
-async function req(method: string, path: string, body?: unknown): Promise<any> {
+async function req<T>(method: string, path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = {};
   const key = getKey();
   if (key) headers["Authorization"] = `Bearer ${key}`;
@@ -199,7 +201,10 @@ async function req(method: string, path: string, body?: unknown): Promise<any> {
     const text = await res.text().catch(() => "");
     throw new Error(`HTTP ${res.status}: ${text || res.statusText}`);
   }
-  return res.json();
+  // 全局唯一一处类型断言：请求打在同源、带 API Key 的管理接口上，
+  // 响应 schema 由下面各 wrapper 的返回类型（与后端 api.rs 一一对应）保证，
+  // 不在传输层再做一次运行时校验
+  return res.json() as Promise<T>;
 }
 
 export interface ClashNode {
@@ -240,8 +245,6 @@ export const api = {
     req("POST", "/api/ports/assign", { keys }),
   portsRelease: (p: { ports?: number[]; keys?: string[] }): Promise<{ ok: boolean; released: number }> =>
     req("POST", "/api/ports/release", p),
-  portsMode: (auto: boolean): Promise<{ ok: boolean; auto: boolean }> =>
-    req("POST", "/api/ports/mode", { auto }),
   refresh: (): Promise<{ ok: boolean }> => req("POST", "/api/refresh"),
   check: (keys?: string[]): Promise<{ ok: boolean }> =>
     req("POST", "/api/check", keys && keys.length ? { keys } : {}),

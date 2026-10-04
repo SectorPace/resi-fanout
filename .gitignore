@@ -5,3 +5,5 @@ node_modules/
 data/
 state.json
 config.json
+# built by CI and release from frontend source; committed copies go stale
+frontend/dist/

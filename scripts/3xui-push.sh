@@ -72,16 +72,24 @@ command -v curl >/dev/null 2>&1 || die "curl is required"
 
 # ------------------------------------------------- auto-detect API endpoint/key
 if [ -z "${API}" ] && [ -f "${RF_CONF}" ]; then
+  # Emit plain assignments rather than `${VAR:-<value>}` expansions: a shell
+  # parameter-expansion default is NOT re-parsed for quotes, so a value that
+  # shlex.quote had to wrap ended up with literal quote characters inside it —
+  # and an unset api_key became the two-character string `''`, which made the
+  # script send `Authorization: Bearer ''` instead of omitting the header.
   eval "$(python3 - "${RF_CONF}" <<'PYEOF2'
 import json, shlex, sys
 cfg = json.load(open(sys.argv[1]))["server"]
 host, _, port = cfg["listen"].rpartition(":")
 scheme = "https" if cfg.get("tls", {}).get("enabled") else "http"
 base = cfg.get("base_path", "").rstrip("/")
-print(f'API="${{1:-{shlex.quote(scheme + "://127.0.0.1:" + port + base)}}}"')
-print(f'KEY="${{RF_KEY:-{shlex.quote(cfg.get("api_key", ""))}}}"')
+print(f'CONF_API={shlex.quote(scheme + "://127.0.0.1:" + port + base)}')
+print(f'CONF_KEY={shlex.quote(cfg.get("api_key", "") or "")}')
 PYEOF2
 )"
+  API="${1:-${CONF_API}}"
+  KEY="${RF_KEY:-${CONF_KEY}}"
+  unset CONF_API CONF_KEY
   log "自动读取到 API: ${API}"
 fi
 [ -n "${API}" ] || API="http://127.0.0.1:7654"
@@ -97,7 +105,10 @@ AUTH=()
 [ -n "${KEY}" ] && AUTH=(-H "Authorization: Bearer ${KEY}")
 
 log "fetching snippet: ${API}/api/3xui/snippet?${Q}"
-curl -fsS "${AUTH[@]}" "${API}/api/3xui/snippet?${Q}" -o "${TMP}" \
+# ${AUTH[@]+"${AUTH[@]}"} rather than "${AUTH[@]}": expanding an empty array
+# under `set -u` is an "unbound variable" error on bash < 4.4, which still
+# ships on CentOS 7 — a supported target per install.sh's header.
+curl -fsS ${AUTH[@]+"${AUTH[@]}"} "${API}/api/3xui/snippet?${Q}" -o "${TMP}" \
   || die "cannot reach resi-fanout API — is the service running?"
 
 # ---------------------------------------------------------------- locate panel db
@@ -110,7 +121,23 @@ fi
 
 log "panel db: ${DB}"
 BACKUP="${DB}.bak.$(date +%Y%m%d%H%M%S)"
-cp -a "${DB}" "${BACKUP}"
+# The panel may be running in WAL mode, where a bare `cp` of the main file
+# silently misses everything still in the -wal sidecar — i.e. it produces a
+# backup that is not the database. VACUUM INTO exports a consistent snapshot
+# (same approach, and same reason, as scripts/xui_db.py).
+if ! python3 - "${DB}" "${BACKUP}" <<'PYBAK'
+import shutil, sqlite3, sys
+
+db, bak = sys.argv[1], sys.argv[2]
+try:
+    sqlite3.connect(db).execute("VACUUM INTO ?", (bak,))
+except sqlite3.Error:
+    # Degraded path (e.g. the db is locked): at least keep the main file.
+    shutil.copy2(db, bak)
+PYBAK
+then
+  die "cannot create a backup of ${DB} — refusing to modify the panel database"
+fi
 log "backup written: ${BACKUP}"
 
 # ---------------------------------------------------------------- inbound linking
@@ -122,7 +149,7 @@ if [ "${LINK_INBOUNDS}" = "1" ] || [ "${UNLINK}" = "1" ]; then
       --inbound-prefix "resi-in-" --outbound-prefix "${PREFIX}" \
       | python3 -m json.tool
   else
-    ENTRIES="$(curl -fsS "${AUTH[@]}" "${API}/api/ports" | RESIDENTIAL="${RESIDENTIAL}" python3 -c '
+    ENTRIES="$(curl -fsS ${AUTH[@]+"${AUTH[@]}"} "${API}/api/ports" | RESIDENTIAL="${RESIDENTIAL}" python3 -c '
 import json, os, sys
 d = json.load(sys.stdin)
 only_resi = os.environ.get("RESIDENTIAL") == "1"
@@ -162,14 +189,14 @@ RULE_INBOUND="${RULE_INBOUND}" RULE_OUTBOUND="${RULE_OUTBOUND}" python3 - "${DB}
 import json, os, sqlite3, sys
 
 db_path, snip_path = sys.argv[1], sys.argv[2]
+if not os.path.exists(db_path):
+    print(f"[error] panel database not found: {db_path}", file=sys.stderr)
+    sys.exit(1)
 snippet = json.load(open(snip_path, encoding="utf-8"))
 outbounds = snippet.get("outbounds", [])
 if not outbounds:
     print("[error] snippet has no outbounds (no healthy/assigned ports?)", file=sys.stderr)
     sys.exit(1)
-
-with open(db_path, "rb") as f:
-    pass  # existence check only
 
 conn = sqlite3.connect(db_path)
 cur = conn.cursor()
@@ -202,9 +229,22 @@ if rule_in:
         rule_out = snippet["outbounds"][0]["tag"]
     tpl.setdefault("routing", {}).setdefault("rules", [])
     rules = tpl["routing"]["rules"]
+    # Drop every existing rule that routes ANY of our tags somewhere else, not
+    # just one whose inboundTag list matches exactly. With exact matching,
+    # re-running with an overlapping set (e.g. "vmess-in,trojan-in" after
+    # "vmess-in") left the old rule in place and Xray then had two conflicting
+    # rules for the same inbound.
+    want = set(rule_in)
+    kept = []
+    for r in rules:
+        tags = r.get("inboundTag")
+        tags = set(tags) if isinstance(tags, list) else ({tags} if tags else set())
+        if tags & want:
+            continue
+        kept.append(r)
     tpl["routing"]["rules"] = [
         {"type": "field", "inboundTag": rule_in, "outboundTag": rule_out}
-    ] + [r for r in rules if not (r.get("inboundTag") == rule_in)]
+    ] + kept
     print(f"[info] routing rule added: {rule_in} -> {rule_out}")
 
 value = json.dumps(tpl, ensure_ascii=False)

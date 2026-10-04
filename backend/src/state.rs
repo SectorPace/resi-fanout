@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
+use serde::ser::{SerializeMap, SerializeSeq};
+use serde::{Deserialize, Serialize, Serializer};
 use tokio::sync::RwLock;
 use tracing::warn;
 
@@ -38,6 +39,38 @@ struct StateFile {
     vpn_tunnels: Vec<VpnTunnel>,
     #[serde(default)]
     vpn_pool: Vec<VpnServer>,
+}
+
+/// Borrowed twin of [`StateFile`], used when writing: the on-disk shape is
+/// identical, but the proxy pool is streamed straight out of the lock instead
+/// of being deep-cloned into a throwaway `Vec` first.
+struct StateFileRef<'a> {
+    proxies: &'a HashMap<String, ProxyInfo>,
+    vpn_tunnels: &'a Vec<VpnTunnel>,
+    vpn_pool: &'a Vec<VpnServer>,
+}
+
+impl Serialize for StateFileRef<'_> {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        let mut m = ser.serialize_map(Some(3))?;
+        m.serialize_entry("proxies", &ProxySeq(self.proxies.values()))?;
+        m.serialize_entry("vpn_tunnels", self.vpn_tunnels)?;
+        m.serialize_entry("vpn_pool", self.vpn_pool)?;
+        m.end()
+    }
+}
+
+/// `Values` is not itself a `Serialize`, so emit it as a JSON array lazily.
+struct ProxySeq<'a>(std::collections::hash_map::Values<'a, String, ProxyInfo>);
+
+impl Serialize for ProxySeq<'_> {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        let mut seq = ser.serialize_seq(None)?;
+        for p in self.0.clone() {
+            seq.serialize_element(&p)?;
+        }
+        seq.end()
+    }
 }
 
 impl AppState {
@@ -111,20 +144,23 @@ impl AppState {
 
     pub async fn save_state(&self) -> anyhow::Result<()> {
         tokio::fs::create_dir_all(&self.data_dir).await?;
-        let map = self.proxies.read().await;
-        let tunnels = self.vpn_tunnels.read().await;
-        let pool = self.vpn_pool.read().await;
-        let sf = StateFile {
-            proxies: map.values().cloned().collect(),
-            vpn_tunnels: tunnels.clone(),
-            vpn_pool: pool.clone(),
-        };
-        drop(map);
-        drop(tunnels);
-        drop(pool);
         let tmp = self.data_dir.join("state.json.tmp");
-        let data = serde_json::to_string(&sf)?;
-        tokio::fs::write(&tmp, data).await?;
+        let json = {
+            let map = self.proxies.read().await;
+            let tunnels = self.vpn_tunnels.read().await;
+            let pool = self.vpn_pool.read().await;
+            let sf = StateFileRef {
+                proxies: &map,
+                vpn_tunnels: &tunnels,
+                vpn_pool: &pool,
+            };
+            // serialise straight out of the guards: the pool can hold tens of
+            // thousands of entries and must not be cloned before it is written
+            let mut out: Vec<u8> = Vec::new();
+            serde_json::to_writer(&mut out, &sf)?;
+            out
+        };
+        tokio::fs::write(&tmp, json).await?;
         tokio::fs::rename(&tmp, self.state_file()).await?;
         Ok(())
     }
@@ -139,13 +175,7 @@ impl AppState {
         }
         if !cfg.filter.countries.is_empty() {
             let cc = p.country_code.as_deref().unwrap_or("").to_uppercase();
-            if cc.is_empty()
-                || !cfg
-                    .filter
-                    .countries
-                    .iter()
-                    .any(|c| c.to_uppercase() == cc)
-            {
+            if cc.is_empty() || !cfg.filter.countries.iter().any(|c| c.to_uppercase() == cc) {
                 return false;
             }
         }

@@ -247,7 +247,12 @@ def do_link(args):
 
     plan, next_port = [], args.inbound_port_base
     for e in entries:
-        port = e["port"]
+        # `entries` comes from --entries (caller-supplied JSON), so a missing
+        # "port" used to raise a bare KeyError traceback on stderr — this tool
+        # documents that every subcommand prints one JSON object to stdout.
+        port = e.get("port")
+        if not isinstance(port, int) or not (1 <= port <= 65535):
+            die(f"entry is missing a usable 'port': {json.dumps(e, ensure_ascii=False)}")
         in_tag = f"{args.inbound_prefix}{port}"
         cc = (e.get("country") or "xx").upper()
         kind = "住宅" if e.get("residential") else "机房"
@@ -435,8 +440,12 @@ def main():
 
     if args.cmd == "list":
         conn = sqlite3.connect(args.db, timeout=30)
-        ok(**list_inbounds(conn))
-        conn.close()
+        try:
+            ok(**list_inbounds(conn))
+        finally:
+            # unreachable via ok() (it exits), but correct if the call ever
+            # returns instead
+            conn.close()
     elif args.cmd in ("preview", "link"):
         if args.cmd == "preview":
             args.dry_run = 1  # preview never writes

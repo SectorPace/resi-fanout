@@ -3,6 +3,7 @@
 //! scripts/xui_db.py (stdlib sqlite3, schema-adaptive for 3x-ui v2/v3);
 //! this module just drives it and restarts x-ui afterwards.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -35,7 +36,13 @@ pub async fn run_script(cfg: &crate::config::XuiCfg, args: &[&str]) -> anyhow::R
             .get("error")
             .and_then(|v| v.as_str())
             .map(str::to_string)
-            .unwrap_or_else(|| if stderr.is_empty() { format!("exit {}", out.status) } else { stderr });
+            .unwrap_or_else(|| {
+                if stderr.is_empty() {
+                    format!("exit {}", out.status)
+                } else {
+                    stderr
+                }
+            });
         anyhow::bail!("{msg}");
     }
     Ok(parsed)
@@ -50,22 +57,36 @@ pub async fn entries_for(
     let mut entries = Vec::new();
     let mut seen = std::collections::HashSet::new();
     {
-        let map = state.proxies.read().await;
+        // one pass over the pool instead of rescanning it per requested port:
+        // `ports` can hold hundreds of entries and the map thousands, and the
+        // guard must not be held across the loop. Only the two fields the
+        // entry needs are copied, so this stays bounded by the assigned ports
+        // instead of deep-cloning the pool.
+        let by_port: HashMap<u16, (Option<String>, bool)> = {
+            let map = state.proxies.read().await;
+            map.values()
+                .filter_map(|p| {
+                    p.local_port
+                        .map(|port| (port, (p.country_code.clone(), p.residential())))
+                })
+                .collect()
+        };
+
         for port in ports {
             if !seen.insert(*port) {
                 continue;
             }
-            let Some(p) = map.values().find(|p| p.local_port == Some(*port)) else {
+            let Some((country, residential)) = by_port.get(port) else {
                 continue;
             };
-            if residential_only && !p.residential() {
+            if residential_only && !*residential {
                 continue;
             }
             // NOTE: `port` is the LOCAL fanout port the socks outbound must use
             entries.push(json!({
                 "port": port,
-                "country": p.country_code.clone().unwrap_or_else(|| "xx".into()),
-                "residential": p.residential(),
+                "country": country.clone().unwrap_or_else(|| "xx".into()),
+                "residential": residential,
                 "kind": "proxy"
             }));
         }
@@ -146,10 +167,7 @@ pub fn script_args(
 }
 
 pub async fn restart_xui() -> String {
-    let which = Command::new("x-ui")
-        .arg("restart")
-        .output()
-        .await;
+    let which = Command::new("x-ui").arg("restart").output().await;
     match which {
         Ok(o) if o.status.success() => "x-ui restarted".into(),
         _ => match Command::new("systemctl")

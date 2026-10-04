@@ -162,7 +162,17 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
                     .map(|(_, p)| p.parse::<u16>().unwrap_or(7654))
                     .unwrap_or(7654);
                 if host == "0.0.0.0" || host == "::" || host.is_empty() {
-                    let fallback = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+                    // `listener` still owns <port> (bound before the TLS attempt),
+                    // and on Linux a wildcard bind blocks a later loopback bind
+                    // unless the first socket is released first — without this
+                    // drop the fallback bind fails with EADDRINUSE and the exact
+                    // restart loop this branch exists to prevent happens instead.
+                    drop(listener);
+                    let fallback = tokio::net::TcpListener::bind(("127.0.0.1", port))
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("bind 127.0.0.1:{port} after TLS failure: {e}")
+                        })?;
                     tracing::warn!(port, "仅在 127.0.0.1 上以 HTTP 提供服务");
                     axum::serve(fallback, app).await?;
                     return Ok(());
@@ -684,7 +694,11 @@ async fn put_config(
     State(state): State<Arc<AppState>>,
     Json(cfg): Json<crate::config::Config>,
 ) -> Response {
-    if cfg.fanout.max_ports == 0 || cfg.fanout.base_port as u32 + cfg.fanout.max_ports > 65536 {
+    // u64 arithmetic on purpose: release builds have overflow checks off, so
+    // `base_port as u32 + max_ports` wraps around and let absurd values like
+    // base_port=65535 + max_ports=u32::MAX pass this guard.
+    let port_end = u64::from(cfg.fanout.base_port) + u64::from(cfg.fanout.max_ports);
+    if cfg.fanout.max_ports == 0 || port_end > 65536 {
         return (StatusCode::BAD_REQUEST, "bad fanout port range").into_response();
     }
     // an invalid base_path would panic while registering routes on the next
@@ -702,9 +716,15 @@ async fn put_config(
         )
             .into_response();
     }
-    if tokio::net::TcpListener::bind(&cfg.server.listen).await.is_err() {
+    // Only probe when the address actually changes. The live listener already owns
+    // the current address, so re-binding it would always fail and emit a
+    // misleading warning on every ordinary config save.
+    let current_listen = state.config().await.server.listen.clone();
+    if cfg.server.listen != current_listen {
         // not fatal, but worth flagging: current listener keeps the old addr
-        tracing::warn!(listen = %cfg.server.listen, "new listen addr not bindable now (applies after restart)");
+        if let Err(e) = tokio::net::TcpListener::bind(&cfg.server.listen).await {
+            tracing::warn!(listen = %cfg.server.listen, error = %e, "new listen addr not bindable now (applies after restart)");
+        }
     }
     *state.cfg.write().await = cfg;
     if let Err(e) = state.save_config().await {

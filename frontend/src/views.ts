@@ -1,5 +1,4 @@
-import { api, type Config, type PortEntry, type Snippet, type VpngateInfo } from "./api";
-import { badge, el, toast } from "./main";
+import { api, fmtTs, type Config, type PortEntry, type Snippet, type VpngateInfo } from "./api";
 
 const PAGE_SIZE = 100;
 
@@ -13,6 +12,95 @@ const proxyState = {
   q: "",
   offset: 0
 };
+
+// DOM helper 放在本文件而不是 main.ts，让依赖保持单向：
+// main.ts 依赖 views.ts，views.ts 不再回头 import main.ts（原来那圈环靠延迟使用才没炸）。
+export function el<K extends keyof HTMLElementTagNameMap>(
+  tag: K,
+  attrs: Record<string, string | ((e: Event) => void)> = {},
+  ...children: (Node | string | null | undefined)[]
+): HTMLElementTagNameMap[K] {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k.startsWith("on") && typeof v === "function") {
+      node.addEventListener(k.slice(2), v as EventListener);
+    } else if (k === "class") {
+      node.className = v as string;
+    } else if (k === "style") {
+      node.setAttribute("style", v as string);
+    } else {
+      node.setAttribute(k, v as string);
+    }
+  }
+  for (const c of children) {
+    if (c == null) continue;
+    node.append(c instanceof Node ? c : document.createTextNode(c));
+  }
+  return node;
+}
+
+export function badge(text: string, tone = ""): HTMLElement {
+  return el("span", { class: `badge ${tone}` }, text);
+}
+
+export function toast(msg: string, ok = true): void {
+  const t = el("div", { class: `toast ${ok ? "ok" : "err"}` }, msg);
+  document.body.append(t);
+  window.setTimeout(() => t.remove(), 3500);
+}
+
+/** 隧道状态 → 徽标色调：up 绿、spawning 黄，其余（down/failed）红。 */
+function statusTone(status: string): string {
+  if (status === "up") return "ok";
+  if (status === "spawning") return "warn";
+  return "err";
+}
+
+/**
+ * 住宅/机房徽标：先看 residential，再看 hosting 是否确定为机房；
+ * 两者都给不出结论时返回 unknown，由调用点决定留空还是标「住宅?」。
+ */
+function residentialBadge(
+  residential: boolean,
+  hosting: boolean | null | undefined,
+  unknown: HTMLElement | string = ""
+): HTMLElement | string {
+  if (residential) return badge("住宅", "res");
+  if (hosting === true) return badge("机房", "");
+  return unknown;
+}
+
+/** 本地端口协议 → 客户端链接 scheme：http 系用 http，其余（socks / mixed）按 socks5 用。 */
+function linkScheme(protocol: string): string {
+  return protocol.startsWith("http") ? "http" : "socks5";
+}
+
+/**
+ * 3x-ui 联动的行（plan / created）里，本地端口优先取 fanout_port，
+ * 老脚本可能只给 port；都没有就留空——绝不能退化去显示 inbound_tag，
+ * 那是面板入站 tag，不是本地端口。
+ */
+function xuiFanoutPort(row: unknown): string {
+  const r = row as { fanout_port?: number | string; port?: number | string };
+  return String(r.fanout_port ?? r.port ?? "");
+}
+
+/** 轮询 fn：标签页切到后台就停表，回到前台再续上，避免隐藏标签页继续打 API。 */
+function startPolling(fn: () => void, ms: number): void {
+  let timer = 0;
+  const start = (): void => {
+    if (!timer) timer = window.setInterval(fn, ms);
+  };
+  const stop = (): void => {
+    window.clearInterval(timer);
+    timer = 0;
+  };
+  start();
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stop();
+    else start();
+  });
+}
 
 export function renderProxies(root: HTMLElement): void {
   root.replaceChildren(
@@ -181,7 +269,7 @@ export function renderProxies(root: HTMLElement): void {
                   {},
                   p.alive ? badge("存活", "ok") : badge("失效", "err"),
                   " ",
-                  p.residential ? badge("住宅", "res") : p.hosting === true ? badge("机房", "") : ""
+                  residentialBadge(p.residential, p.hosting)
                 ),
                 el("td", { class: "mono" }, p.local_port ? String(p.local_port) : "—")
               )
@@ -190,6 +278,8 @@ export function renderProxies(root: HTMLElement): void {
         )
       );
     } catch (e) {
+      // 失败也走同一道序号闸：慢的旧请求报错不能盖掉更新的成功结果
+      if (mySeq !== proxySeq) return;
       box.replaceChildren(el("div", { class: "error" }, String(e)));
     }
   }
@@ -206,7 +296,7 @@ export function renderPorts(root: HTMLElement): void {
         onclick: async () => {
           try {
             const { items } = await api.ports();
-            const lines = items.map((p) => `socks5://127.0.0.1:${p.port}#${p.country_code || p.protocol}-${p.port}`);
+            const lines = items.map((p) => `${linkScheme(p.protocol)}://127.0.0.1:${p.port}#${p.country_code || p.protocol}-${p.port}`);
             await navigator.clipboard.writeText(lines.join("\n"));
             toast(`已复制 ${lines.length} 条 socks 链接`);
           } catch (e) { toast(String(e), false); }
@@ -312,6 +402,8 @@ export function renderVpngate(root: HTMLElement): void {
     try {
       info = await api.vpngate();
     } catch (e) {
+      // 同上：序号已过期就别再把错误写到页面上
+      if (mySeq !== vgSeq) return;
       const t = document.getElementById("vg-tunnels");
       if (t) t.replaceChildren(el("div", { class: "error" }, String(e)));
       return;
@@ -321,7 +413,7 @@ export function renderVpngate(root: HTMLElement): void {
       const m = (info as unknown as { meta?: { source?: string; rows?: number; at?: number } }).meta;
       const src = m?.source ? ` · 源 ${m.source.split("/")[2] ?? m.source}` : "";
       hint.textContent = info.enabled
-        ? ` 已启用 · 在线 ${info.pool_size} 台 · 累计缓存 ${info.pool_cached} 台${src} · 更新 ${fmtTs2(info.pool_ts)}`
+        ? ` 已启用 · 在线 ${info.pool_size} 台 · 累计缓存 ${info.pool_cached} 台${src} · 更新 ${fmtTs(info.pool_ts)}`
         : " 未启用：在「配置」页开启 vpngate.enabled 并安装 openvpn";
     }
     const tb = document.getElementById("vg-tunnels");
@@ -344,8 +436,8 @@ export function renderVpngate(root: HTMLElement): void {
                   el("td", {}, t.country_code || "—"),
                   el("td", { class: "dim" }, t.isp || "—"),
                   el("td", {}, t.latency_ms != null ? `${t.latency_ms}ms` : "—"),
-                  el("td", {}, badge(t.status, t.status === "up" ? "ok" : t.status === "spawning" ? "warn" : "err")),
-                  el("td", {}, t.residential ? badge("住宅", "res") : t.hosting === true ? badge("机房", "") : t.alive ? badge("住宅?", "res") : "—")
+                  el("td", {}, badge(t.status, statusTone(t.status))),
+                  el("td", {}, residentialBadge(t.residential, t.hosting, t.alive ? badge("住宅?", "res") : "—"))
                 ))
               : [el("tr", {}, el("td", { colspan: "7", class: "empty" }, info.enabled ? "隧道建立中…（首次连接约需 10-30 秒）" : "未启用"))])
           )
@@ -372,7 +464,7 @@ export function renderVpngate(root: HTMLElement): void {
               el("td", {}, fmtUptime2(s.uptime_secs)),
               el("td", {}, s.logs_kept == null ? "—" : s.logs_kept ? badge("记录", "warn") : badge("不记录", "ok")),
               el("td", {}, String(s.score)),
-              el("td", { class: "dim" }, s.last_seen ? fmtTs2(s.last_seen) : "缓存")
+              el("td", { class: "dim" }, s.last_seen ? fmtTs(s.last_seen) : "缓存")
             ))
           )
         )
@@ -380,9 +472,7 @@ export function renderVpngate(root: HTMLElement): void {
     }
   }
 
-  function fmtTs2(ts?: number | null): string {
-    return ts ? new Date(ts * 1000).toLocaleString("zh-CN", { hour12: false }) : "—";
-  }
+  // 时间戳格式化直接用 api.ts 的 fmtTs；这里只留更粗的「X天X时」给候选服务器列表
   function fmtUptime2(secs: number): string {
     const d = Math.floor(secs / 86400);
     const h = Math.floor((secs % 86400) / 3600);
@@ -390,14 +480,10 @@ export function renderVpngate(root: HTMLElement): void {
   }
 
   void reload();
-  const timer = window.setInterval(() => void reload(), 15000);
-  const obs = new MutationObserver(() => {
-    if (!document.body.contains(root)) {
-      window.clearInterval(timer);
-      obs.disconnect();
-    }
-  });
-  obs.observe(document.body, { childList: true, subtree: true });
+  // 原来的 MutationObserver 盯 document.body 想在 root 被摘掉时停表，
+  // 但观察根永远不会被移除，分支进不去，等于每次 DOM 变动都空跑一次；
+  // 改成随 visibilitychange 暂停/恢复轮询。
+  startPolling(() => void reload(), 15000);
 }
 
 export function renderWarp(root: HTMLElement): void {
@@ -532,7 +618,9 @@ export function renderWarp(root: HTMLElement): void {
         r.mode === "masque" ? `Mihomo 旁挂端口 ${r.port}` : "已存为 WireGuard 配置，点「连接」生效",
         r.sidecar_started === false && r.hint ? `（未自动启动：${r.hint}）` : ""
       ].filter(Boolean).join(" · ");
-      if (out) out.replaceChildren(el("div", { class: "error", style: "border-color:var(--ok);color:var(--ok);background:rgba(63,185,111,.1)" }, msg));
+      // class 必须与结果一致：成功不能挂着 .error 再靠行内样式改成绿的，
+      // 否则读屏/样式上它仍是一条错误；配色只留行内这一处来源（不能改 style.css）
+      if (out) out.replaceChildren(el("div", { class: "ok", style: "color:var(--ok)" }, msg));
       toast(msg);
       await loadWarp();
     } catch (e) {
@@ -567,6 +655,8 @@ export function renderWarp(root: HTMLElement): void {
         out.value = JSON.stringify(w.xray_outbound, null, 2);
       }
     } catch (e) {
+      // 序号已过期的失败请求直接丢弃，别盖掉更新的状态
+      if (mySeq !== warpSeq) return;
       box.textContent = String(e);
     }
     const tb = document.getElementById("warp-tunnels");
@@ -608,11 +698,11 @@ export function renderWarp(root: HTMLElement): void {
                   el("td", {}, t.country_code || "—"),
                   el("td", { class: "dim" }, t.isp || "—"),
                   el("td", {}, t.latency_ms != null ? `${t.latency_ms}ms` : "—"),
-                  el("td", {}, badge(t.status, t.status === "up" ? "ok" : "warn")),
+                  el("td", {}, badge(t.status, statusTone(t.status))),
                   el("td", {},
                     t.server_key === "warp" ? badge("WARP WireGuard", "acc") : badge("MASQUE", "acc"),
                     " ",
-                    t.residential ? badge("住宅", "res") : t.hosting === true ? badge("机房", "") : "")
+                    residentialBadge(t.residential, t.hosting))
                 ))
               : [el("tr", {}, el("td", { colspan: "7", class: "empty" }, "暂无 WARP / MASQUE 出口"))])
           )
@@ -620,14 +710,8 @@ export function renderWarp(root: HTMLElement): void {
       );
   }
   void loadWarp();
-  const warpTimer = window.setInterval(() => void loadWarp(), 15000);
-  const warpObs = new MutationObserver(() => {
-    if (!document.body.contains(root)) {
-      window.clearInterval(warpTimer);
-      warpObs.disconnect();
-    }
-  });
-  warpObs.observe(document.body, { childList: true, subtree: true });
+  // 与 VPN Gate 页同一处理：不再挂那个永远进不去的 MutationObserver
+  startPolling(() => void loadWarp(), 15000);
 }
 
 export async function renderConfig(root: HTMLElement): Promise<void> {
@@ -752,11 +836,26 @@ export async function renderConfig(root: HTMLElement): Promise<void> {
             class: "primary",
             onclick: async () => {
               try {
+                // 代理源文本框以前根本没人读：用户改了却照样提示「已保存」，
+                // 改动被静默丢弃。这里先解析，失败就直接抛出去（下方 catch 弹错误提示），
+                // 绝不带着坏 JSON 去保存。
+                const sourcesBox = document.getElementById("c-sources") as HTMLTextAreaElement | null;
+                let sources: Config["sources"] = cfg.sources;
+                if (sourcesBox) {
+                  const raw = sourcesBox.value.trim();
+                  const parsed: unknown = raw ? JSON.parse(raw) : [];
+                  const allObjects =
+                    Array.isArray(parsed) &&
+                    parsed.every((x) => typeof x === "object" && x !== null && !Array.isArray(x));
+                  if (!allObjects) throw new Error("代理源必须是 JSON 对象数组，请修正后重新保存");
+                  sources = parsed as Config["sources"];
+                }
                 // 基于服务端当前配置做增量覆盖：只改表单里出现的字段，
                 // 绝不能丢掉 base_path / tls / warp / xui 等未暴露的段
                 // （丢掉会把公网 HTTPS + 随机路径降级成明文 HTTP）
                 const next: Config = {
                   ...cfg,
+                  sources,
                   server: {
                     ...cfg.server,
                     listen: get("c-listen"),
@@ -924,7 +1023,7 @@ export function renderXui(root: HTMLElement): void {
     const mode = (document.getElementById("xui-mode") as HTMLSelectElement).value;
     const body: { template_id: number; ports?: number[]; residential_only: boolean } = {
       template_id: Number(sel.value) || 0,
-      residential_only: mode === "balancer" ? false : false
+      residential_only: mode !== "balancer"
     };
     if (mode !== "balancer") {
       const checked = checkedPorts();
@@ -959,7 +1058,7 @@ export function renderXui(root: HTMLElement): void {
               el(
                 "tr",
                 {},
-                el("td", { class: "mono" }, String((row as Record<string, unknown>).fanout_port ?? (row as Record<string, unknown>).inbound_tag ?? "")),
+                el("td", { class: "mono" }, xuiFanoutPort(row)),
                 el("td", { class: "mono" }, String(row.inbound_port)),
                 el("td", { class: "mono small" }, row.link || "")
               )

@@ -125,9 +125,9 @@ pub fn parse_ovpn_configs(text: &str) -> Vec<VpnServer> {
             .lines()
             .find_map(|l| {
                 let t = l.trim();
-                t.starts_with("subject=").then(|| t.to_string()).or_else(|| {
-                    t.starts_with("/C=").then(|| t.to_string())
-                })
+                t.starts_with("subject=")
+                    .then(|| t.to_string())
+                    .or_else(|| t.starts_with("/C=").then(|| t.to_string()))
             })
             .and_then(|s| cert_country(&s));
         out.push(VpnServer {
@@ -151,10 +151,23 @@ pub fn parse_ovpn_configs(text: &str) -> Vec<VpnServer> {
     out
 }
 
+/// Locate the `C=` marker of an X.509 subject and report how many bytes it
+/// spans. The offset has to follow the pattern that actually matched: `"C = "`
+/// is four characters wide while `"C="` is two, and getting that wrong turns
+/// the documented `C = JP, O = ...` form into `"= JP..."`.
+fn find_country_marker(subject: &str) -> Option<(usize, usize)> {
+    for pat in ["/C=", "C = ", "C="] {
+        if let Some(i) = subject.find(pat) {
+            return Some((i, pat.len()));
+        }
+    }
+    None
+}
+
 fn cert_country(subject: &str) -> Option<String> {
     // "/C=JP/O=.../CN=public-vpn-1" or "C = JP, O = ..."
-    let idx = subject.find("/C=").or_else(|| subject.find("C = ").or_else(|| subject.find("C=")))?;
-    let rest = &subject[idx + if subject[idx..].starts_with("/C=") { 3 } else { 2 }..];
+    let (idx, width) = find_country_marker(subject)?;
+    let rest = &subject[idx + width..];
     let code: String = rest
         .chars()
         .take_while(|c| c.is_ascii_alphanumeric())
@@ -176,6 +189,9 @@ pub struct FetchMeta {
 
 const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SNAPSHOT_ROWS: usize = 5000;
+/// Ceiling for the cache age, so a nonsense `cache_days` cannot wrap the
+/// cutoff around and silently retain every relay forever.
+const MAX_CACHE_DAYS: u64 = 365_000;
 const CSV_MARKER: &str = "OpenVPN_ConfigData_Base64";
 
 /// A captive portal or an error page must never make it into the pool, so a
@@ -216,15 +232,26 @@ async fn fetch_first_valid(
     for (url, ovpn_style) in candidates {
         let fetch_url = url.clone();
         let got: anyhow::Result<Vec<u8>> = async {
-            let resp = client.get(&fetch_url).send().await?;
+            let mut resp = client.get(&fetch_url).send().await?;
             if !resp.status().is_success() {
                 anyhow::bail!("http {}", resp.status());
             }
-            let bytes = resp.bytes().await?;
-            if bytes.len() > MAX_SNAPSHOT_BYTES {
-                anyhow::bail!("too large: {} bytes", bytes.len());
+            // reject on the announced length first, then enforce the same cap
+            // while streaming: buffering the body and only then comparing its
+            // size leaves a hostile mirror free to OOM us.
+            if let Some(len) = resp.content_length() {
+                if len > MAX_SNAPSHOT_BYTES as u64 {
+                    anyhow::bail!("too large: {len} bytes (cap {MAX_SNAPSHOT_BYTES})");
+                }
             }
-            Ok(bytes.to_vec())
+            let mut bytes: Vec<u8> = Vec::new();
+            while let Some(chunk) = resp.chunk().await? {
+                if bytes.len() + chunk.len() > MAX_SNAPSHOT_BYTES {
+                    anyhow::bail!("body exceeds the {MAX_SNAPSHOT_BYTES} byte cap");
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            Ok(bytes)
         }
         .await;
 
@@ -272,11 +299,22 @@ async fn save_snapshot(state: &Arc<AppState>, text: &str, meta: &FetchMeta) {
 /// On total failure the last known-good local snapshot is reused.
 pub async fn refresh_pool(state: &Arc<AppState>) {
     let cfg = state.config().await;
-    let client = crate::sources::build_client();
+    let client = match crate::sources::build_client() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "vpngate: cannot build http client, keeping cached pool");
+            return;
+        }
+    };
 
     let fetched = tokio::time::timeout(
         std::time::Duration::from_secs(90),
-        fetch_first_valid(&client, &cfg.vpngate.api_url, &cfg.vpngate.mirror_urls, &cfg.vpngate.extra_urls),
+        fetch_first_valid(
+            &client,
+            &cfg.vpngate.api_url,
+            &cfg.vpngate.mirror_urls,
+            &cfg.vpngate.extra_urls,
+        ),
     )
     .await;
 
@@ -295,9 +333,14 @@ pub async fn refresh_pool(state: &Arc<AppState>) {
             (servers, meta)
         }
         Ok(Err(errors)) => {
-            warn!(?errors, "vpngate: all sources failed, falling back to local snapshot");
+            warn!(
+                ?errors,
+                "vpngate: all sources failed, falling back to local snapshot"
+            );
             let dir = snapshot_dir(state);
-            let recovered = tokio::fs::read_to_string(dir.join("snapshot.csv")).await.ok();
+            let recovered = tokio::fs::read_to_string(dir.join("snapshot.csv"))
+                .await
+                .ok();
             match recovered {
                 Some(text) if looks_like_vpngate_csv(&text) => {
                     let servers = parse_csv(&text);
@@ -341,7 +384,8 @@ pub async fn refresh_pool(state: &Arc<AppState>) {
         }
     }
     // prune by age + cap
-    let cutoff = now - (cfg.vpngate.cache_days as i64) * 86400;
+    let days = cfg.vpngate.cache_days.min(MAX_CACHE_DAYS);
+    let cutoff = now.saturating_sub((days as i64).saturating_mul(86400));
     pool.retain(|s| s.last_seen >= cutoff);
     if cfg.vpngate.max_pool > 0 && pool.len() > cfg.vpngate.max_pool {
         pool.sort_by(|a, b| b.last_seen.cmp(&a.last_seen).then(b.score.cmp(&a.score)));
@@ -349,9 +393,13 @@ pub async fn refresh_pool(state: &Arc<AppState>) {
     }
     let cached = pool.len();
     drop(pool);
-    state.vpn_pool_ts.store(now, std::sync::atomic::Ordering::Relaxed);
+    state
+        .vpn_pool_ts
+        .store(now, std::sync::atomic::Ordering::Relaxed);
     *state.vpn_meta.write().await = Some(meta.clone());
-    state.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
+    state
+        .dirty
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     info!(source = %meta.source, live = live_before, cached, sha = %&meta.sha256[..8.min(meta.sha256.len())], "vpngate pool refreshed");
 }
 
@@ -383,4 +431,31 @@ pub fn rank(pool: &[VpnServer], countries: &[String], min_speed_mbps: u64) -> Ve
             .then_with(|| a.ping_ms.cmp(&b.ping_ms))
     });
     list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cert_country_parses_all_documented_shapes() {
+        // openssl-style one-line subject
+        assert_eq!(cert_country("/C=JP/O=x/CN=y").as_deref(), Some("JP"));
+        // the "C = JP, O = ..." form printed by `openssl x509 -subject`
+        assert_eq!(cert_country("C = JP, O = x").as_deref(), Some("JP"));
+        // bare marker, as embedded in an .ovpn `subject=` line
+        assert_eq!(cert_country("C=JP").as_deref(), Some("JP"));
+    }
+
+    #[test]
+    fn cert_country_rejects_unusable_values() {
+        // no country marker at all
+        assert_eq!(cert_country("CN=public-vpn-1"), None);
+        // three-letter code is not an ISO country
+        assert_eq!(cert_country("/C=JPN/O=x"), None);
+        // digits are not a country code
+        assert_eq!(cert_country("C = 12, O = x"), None);
+        // empty value
+        assert_eq!(cert_country("/C=/O=x"), None);
+    }
 }

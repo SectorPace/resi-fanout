@@ -1,30 +1,7 @@
 import { api, fmtTs, fmtUptime, getKey, setKey, type Status } from "./api";
 import "./style.css";
-import { renderProxies, renderPorts, renderConfig, renderXui, renderVpngate, renderWarp } from "./views";
-
-export function el<K extends keyof HTMLElementTagNameMap>(
-  tag: K,
-  attrs: Record<string, string | ((e: Event) => void)> = {},
-  ...children: (Node | string | null | undefined)[]
-): HTMLElementTagNameMap[K] {
-  const node = document.createElement(tag);
-  for (const [k, v] of Object.entries(attrs)) {
-    if (k.startsWith("on") && typeof v === "function") {
-      node.addEventListener(k.slice(2), v as EventListener);
-    } else if (k === "class") {
-      node.className = v as string;
-    } else if (k === "style") {
-      node.setAttribute("style", v as string);
-    } else {
-      node.setAttribute(k, v as string);
-    }
-  }
-  for (const c of children) {
-    if (c == null) continue;
-    node.append(c instanceof Node ? c : document.createTextNode(c));
-  }
-  return node;
-}
+// el / badge / toast 也住在 views.ts 里（那边导出），依赖只剩 main → views 单向
+import { badge, el, renderProxies, renderPorts, renderConfig, renderXui, renderVpngate, renderWarp, toast } from "./views";
 
 let statusTimer: number | undefined;
 
@@ -102,22 +79,14 @@ function card(label: string, value: string, tone = ""): HTMLElement {
   );
 }
 
-export function badge(text: string, tone = ""): HTMLElement {
-  return el("span", { class: `badge ${tone}` }, text);
-}
-
-export function toast(msg: string, ok = true): void {
-  const t = el("div", { class: `toast ${ok ? "ok" : "err"}` }, msg);
-  document.body.append(t);
-  window.setTimeout(() => t.remove(), 3500);
-}
-
 function buildShell(): void {
   app.replaceChildren(
     el(
       "header",
       { class: "topbar" },
       el("h1", {}, "Resi-Fanout", el("small", {}, " · 住宅代理扇出 → 3x-ui")),
+      // pollStatus 里一直在等这个节点填版本号，之前没人建它，后端版本永远显示不出来
+      el("span", { id: "ver-chip", class: "ver-chip" }, "v…"),
       el("span", { id: "busy-indicator", class: "busy" }),
       el(
         "span",

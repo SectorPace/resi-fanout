@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 use crate::models::Protocol;
@@ -94,6 +95,10 @@ impl Default for FanoutCfg {
 #[serde(default)]
 pub struct CheckerCfg {
     pub timeout_secs: u64,
+    /// In-flight classifier requests. Keep this at or below what
+    /// `classify_url` allows per minute: the default ip-api.com endpoint
+    /// throttles at ~45 req/min per IP, and a throttled response is NOT
+    /// treated as a dead proxy, but it still means the round learns nothing.
     pub concurrency: usize,
     /// Upper bound on stored candidates (memory bound); worst entries evicted.
     pub max_pool: usize,
@@ -366,14 +371,32 @@ fn default_sources() -> Vec<SourceCfg> {
 }
 
 impl Config {
+    /// Load the config, falling back to defaults **only** when the file is
+    /// genuinely absent (first run).
+    ///
+    /// Any other read failure must abort startup. Substituting defaults here
+    /// used to fail *open*: `Config::default()` has an empty `api_key`, so a
+    /// transient EACCES (e.g. `chown root:resi-fanout` having failed) silently
+    /// brought the whole `/api` surface up unauthenticated, on the default
+    /// port, with a `web_root` that does not resolve — and then tried to
+    /// overwrite the operator's config with those defaults.
     pub fn load(path: &str) -> anyhow::Result<Config> {
         match std::fs::read_to_string(path) {
-            Ok(s) => Ok(serde_json::from_str(&s)?),
-            Err(_) => {
+            Ok(s) => serde_json::from_str(&s).with_context(|| format!("parse config {path}")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let c = Config::default();
-                let _ = c.save_to(path);
+                if let Err(write_err) = c.save_to(path) {
+                    tracing::warn!(path, error = %write_err, "could not write default config");
+                }
+                tracing::warn!(path, "no config file yet, using built-in defaults");
                 Ok(c)
             }
+            Err(e) => anyhow::bail!(
+                "cannot read config {path}: {e}\n\
+                 refusing to start with default settings, because the default api_key is empty \
+                 (every /api route would be unauthenticated). Fix the file or its permissions, \
+                 e.g. chown root:resi-fanout {path} && chmod 640 {path}"
+            ),
         }
     }
 
@@ -384,7 +407,29 @@ impl Config {
             }
         }
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, data)?;
+        // Write to a sibling temp file and rename, so a crash (or a full disk)
+        // mid-write cannot leave a truncated config behind: a half-written file
+        // fails to parse, and `load` now aborts on that instead of quietly
+        // resetting the settings. The mode of the existing file is carried over
+        // because install.sh hands this file to root:<app> 0640 and the default
+        // 0644 would expose the api_key to every local account.
+        let tmp = format!("{path}.tmp");
+        std::fs::write(&tmp, data.as_bytes())?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(path)
+                .map(|m| m.permissions().mode() & 0o7777)
+                .unwrap_or(0o600);
+            if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 }

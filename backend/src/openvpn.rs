@@ -20,11 +20,17 @@ use crate::state::AppState;
 
 const MAX_ATTEMPTS: u32 = 3;
 const CLASSIFY_EVERY_SECS: i64 = 15 * 60;
+/// A child that is alive but never publishes its tun address holds its slot
+/// forever otherwise: `resolv-retry infinite` means openvpn retries name
+/// resolution indefinitely and never exits, so liveness is no evidence of
+/// progress.
+const TUNNEL_START_DEADLINE_SECS: i64 = 120;
 
 struct RunningVpn {
     child: Child,
     relay: Option<JoinHandle<()>>,
     last_tun: Option<IpAddr>,
+    started_at: i64,
 }
 
 pub fn spawn_supervisor(state: Arc<AppState>) {
@@ -80,7 +86,8 @@ async fn reconcile(state: &Arc<AppState>, cfg: &crate::config::Config, running: 
         return;
     }
 
-    let changed = {
+    let mut changed = false;
+    {
         let pool = state.vpn_pool.read().await;
         let mut tunnels = state.vpn_tunnels.write().await;
         let pool_has = |key: &str| pool.iter().any(|s| s.server_key() == key);
@@ -92,6 +99,7 @@ async fn reconcile(state: &Arc<AppState>, cfg: &crate::config::Config, running: 
                 true
             } else {
                 info!(key = %t.server_key, "vpngate: server left the pool, dropping tunnel");
+                changed = true;
                 false
             }
         });
@@ -100,9 +108,11 @@ async fn reconcile(state: &Arc<AppState>, cfg: &crate::config::Config, running: 
         tunnels.retain(|t| {
             if t.status == "failed" && t.attempts >= MAX_ATTEMPTS {
                 info!(key = %t.server_key, "vpngate: rotating out failed tunnel");
+                changed = true;
                 return false;
             }
             if t.status == "blacklisted" {
+                changed = true;
                 return false;
             }
             true
@@ -131,9 +141,9 @@ async fn reconcile(state: &Arc<AppState>, cfg: &crate::config::Config, running: 
                 status: "spawning".into(),
                 ..Default::default()
             });
+            changed = true;
         }
-        true
-    };
+    }
 
     // 4) per-tunnel supervision
     let mut dirty = changed;
@@ -149,7 +159,7 @@ async fn reconcile(state: &Arc<AppState>, cfg: &crate::config::Config, running: 
                 Ok(child) => {
                     running.insert(
                         t.local_port,
-                        RunningVpn { child, relay: None, last_tun: None },
+                        RunningVpn { child, relay: None, last_tun: None, started_at: now_ts() },
                     );
                     mark(state, &t.server_key, |x| x.status = "spawning".into()).await;
                     dirty = true;
@@ -224,6 +234,29 @@ async fn reconcile(state: &Arc<AppState>, cfg: &crate::config::Config, running: 
             }
         }
 
+        // never came up: rotate instead of holding the slot forever
+        if r.last_tun.is_none() && now_ts() - r.started_at > TUNNEL_START_DEADLINE_SECS {
+            warn!(
+                port = t.local_port,
+                server = %t.server_key,
+                "vpngate: tunnel did not come up within {}s, rotating",
+                TUNNEL_START_DEADLINE_SECS
+            );
+            if let Some(h) = r.relay.take() {
+                h.abort();
+            }
+            stop_openvpn(&mut r.child).await;
+            running.remove(&t.local_port);
+            let _ = tokio::fs::remove_file(&ipfile).await;
+            mark(state, &t.server_key, |x| {
+                x.attempts += 1;
+                x.status = if x.attempts >= MAX_ATTEMPTS { "failed".into() } else { "down".into() };
+            })
+            .await;
+            dirty = true;
+            continue;
+        }
+
         // 4d) classify through the tunnel (residential detection)
         let need_classify = match (t.status.as_str(), t.last_check) {
             ("up", None) => true,
@@ -259,7 +292,7 @@ async fn reconcile(state: &Arc<AppState>, cfg: &crate::config::Config, running: 
                         .await;
                         if only_resi && !resi {
                             if let Some(rv) = running.get_mut(&t.local_port) {
-                                let _ = rv.child.kill().await;
+                                stop_openvpn(&mut rv.child).await;
                             }
                         }
                         dirty = true;
@@ -280,7 +313,7 @@ async fn reconcile(state: &Arc<AppState>, cfg: &crate::config::Config, running: 
                 if let Some(h) = rv.relay.take() {
                     h.abort();
                 }
-                let _ = rv.child.kill().await;
+                stop_openvpn(&mut rv.child).await;
                 let _ = tokio::fs::remove_file(state.data_dir.join("vpn").join(format!("tunnel-{port}.ip"))).await;
                 info!(port, "vpngate: tunnel stopped");
             }
@@ -290,6 +323,84 @@ async fn reconcile(state: &Arc<AppState>, cfg: &crate::config::Config, running: 
     if dirty {
         state.dirty.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// Directives a remote VPN Gate config is never allowed to set.
+///
+/// The config arrives base64-encoded inside a third-party HTTP response and is
+/// then handed to openvpn with `script-security 2` and full `CAP_NET_ADMIN`,
+/// so anything reachable from here is remote code execution or host-routing
+/// takeover. Grouped by what they would let the server do.
+const FORBIDDEN_DIRECTIVES: &[&str] = &[
+    // run arbitrary programs
+    "up", "down", "route-up", "ipchange", "client-connect", "learn-address",
+    "tls-verify", "plugin", "config", "cd", "chroot", "daemon", "askpass",
+    // environment / privileges / config we own
+    "setenv", "setenv-safe", "script-security", "user", "group", "auth-user-pass",
+    // take over host routing (we use route-nopull + `ip rule from ... table N`)
+    "route", "route-ipv6", "route-delay", "iproute", "redirect-gateway",
+    "redirect-private", "pull", "pull-filter", "client-config-dir",
+    // devices / logging we set ourselves
+    "dev", "dev-node", "dev-type", "log", "log-append", "status", "writepid",
+    "management", "management-client", "management-query-passwords",
+];
+
+/// The directive name of one OpenVPN config line, lowercased, or `None` for
+/// blanks/comments.
+///
+/// Handles the two shapes that made a naive `starts_with("up ")` unsafe:
+/// arbitrary runs of spaces/tabs between the directive and its first argument,
+/// and the optional `--` prefix that OpenVPN also accepts in config files.
+fn directive_of(line: &str) -> Option<String> {
+    let t = line.trim_start_matches([' ', '\t']);
+    if t.is_empty() || t.starts_with('#') || t.starts_with(';') {
+        return None;
+    }
+    let t = t.strip_prefix("--").unwrap_or(t);
+    let tok = t.split([' ', '\t']).next()?;
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok.to_ascii_lowercase())
+    }
+}
+
+/// Drop forbidden directives from a remote .ovpn, preserving inline blocks.
+///
+/// `<ca>`, `<cert>`, `<key>` and `<tls-auth>` payloads span many lines and are
+/// *not* directives, so their contents are copied through verbatim; filtering
+/// them would corrupt the tunnel material.
+fn sanitize_remote_config(base: &str, port: u16) -> String {
+    let mut out = String::with_capacity(base.len());
+    let mut in_block = false;
+    for line in base.lines() {
+        let t = line.trim();
+        if in_block {
+            out.push_str(line);
+            out.push('\n');
+            if t.contains("</") {
+                in_block = false;
+            }
+            continue;
+        }
+        if t.starts_with('<') {
+            // opening tag (possibly with the payload on the same line)
+            in_block = !t.contains("</");
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        match directive_of(line) {
+            Some(d) if FORBIDDEN_DIRECTIVES.contains(&d.as_str()) => {
+                warn!(directive = %d, port, "vpngate: dropped directive from remote config");
+            }
+            _ => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
 }
 
 async fn spawn_openvpn(
@@ -312,23 +423,12 @@ async fn spawn_openvpn(
     let base_conf = String::from_utf8(B64.decode(&server.config_b64)?)
         .map_err(|_| anyhow::anyhow!("config is not valid utf8"))?;
 
-    // strip directives we override
-    let mut conf = String::new();
-    for line in base_conf.lines() {
-        let l = line.trim();
-        if l.starts_with("dev ")
-            || l.starts_with("redirect-gateway")
-            || l.starts_with("up ")
-            || l.starts_with("down ")
-            || l.starts_with("script-security")
-            || l.starts_with("log")
-            || l.starts_with("auth-user-pass")
-        {
-            continue;
-        }
-        conf.push_str(line);
-        conf.push('\n');
-    }
+    // Strip directives a third-party VPN Gate config must never control.
+    // This has to match the *parsed* directive name, not a literal prefix:
+    // OpenVPN treats spaces AND tabs as parameter delimiters (that is why the
+    // manual documents `[SPACE]` for escaping a literal one), so the previous
+    // `starts_with("up ")` check was trivially bypassed by `up\t/tmp/evil.sh`.
+    let mut conf = sanitize_remote_config(&base_conf, t.local_port);
 
     let ipfile = vpn_dir.join(format!("tunnel-{}.ip", t.local_port));
     let logfile = vpn_dir.join(format!("tunnel-{}.log", t.local_port));
@@ -379,6 +479,32 @@ async fn spawn_openvpn(
     Ok(child)
 }
 
+/// Tear an openvpn child down *gracefully*.
+///
+/// `Child::kill()` sends SIGKILL, which openvpn cannot handle: it never runs its
+/// `down` hook, so `scripts/vpn-down.sh` never removes the
+/// `ip rule from <tun-ip> lookup <table>` and the table route that
+/// `scripts/vpn-up.sh` installed. Every rotation (blacklisted exit, server
+/// leaving the pool, feature disabled) therefore leaked one kernel rule keyed
+/// to the dead tunnel IP. SIGTERM lets openvpn tear down cleanly; SIGKILL is
+/// only the fallback if it ignores the signal.
+async fn stop_openvpn(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // SAFETY: `pid` is a child this supervisor spawned and still owns, and
+        // kill(2) takes no pointers into our address space.
+        let term_ok = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) == 0 };
+        if term_ok {
+            if tokio::time::timeout(Duration::from_secs(5), child.wait()).await.is_ok() {
+                return;
+            }
+            warn!("openvpn ignored SIGTERM, escalating to SIGKILL");
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
 async fn mark(state: &Arc<AppState>, server_key: &str, f: impl FnOnce(&mut VpnTunnel)) {
     let mut tunnels = state.vpn_tunnels.write().await;
     if let Some(t) = tunnels.iter_mut().find(|t| t.server_key == server_key) {
@@ -391,7 +517,7 @@ async fn stop_all(running: &mut HashMap<u16, RunningVpn>, state: &Arc<AppState>)
         if let Some(h) = rv.relay.take() {
             h.abort();
         }
-        let _ = rv.child.kill().await;
+        stop_openvpn(&mut rv.child).await;
         let _ = tokio::fs::remove_file(state.data_dir.join("vpn").join(format!("tunnel-{port}.ip"))).await;
         info!(port, "vpngate: tunnel stopped (disabled)");
     }

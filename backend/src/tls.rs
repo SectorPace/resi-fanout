@@ -11,13 +11,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyper::server::conn::http1;
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::config::TlsCfg;
+
+/// This listener is meant to be reachable from the internet, so a client that
+/// never finishes its request must not keep a task (and a descriptor) forever.
+const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(15);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Upper bound on connections served at once; without it a slowloris client can
+/// still exhaust the process long before it exhausts the listen backlog.
+const MAX_CONNECTIONS: usize = 512;
 
 pub struct TlsHandle {
     acceptor: Arc<RwLock<Arc<tokio_rustls::TlsAcceptor>>>,
@@ -76,6 +84,11 @@ fn fingerprint(path: &str) -> Option<(u64, u64)> {
 }
 
 /// Accept loop with a hot-swappable TLS acceptor.
+///
+/// The certificate is re-checked from a real timer, not from connection
+/// arrivals: counting accepted sockets meant an idle service never reloaded
+/// its files, and the first connection after a renewal was still served with
+/// the old certificate.
 pub async fn serve(
     handle: TlsHandle,
     listener: TcpListener,
@@ -83,39 +96,54 @@ pub async fn serve(
     cfg: TlsCfg,
 ) -> anyhow::Result<()> {
     let mut last = fingerprint(&cfg.cert_path);
-    let mut since_check = Duration::ZERO;
+    let period = Duration::from_secs(cfg.reload_secs.max(10));
+    let mut reload = tokio::time::interval(period);
+    reload.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
-        let acceptor = handle.acceptor.read().await.clone();
-        let (tcp, peer) = listener.accept().await?;
-        let app = app.clone();
-        tokio::spawn(async move {
-            match acceptor.accept(tcp).await {
-                Ok(stream) => {
-                    let svc = TowerToHyperService::new(app.clone());
-                    if let Err(e) = http1::Builder::new()
-                        .serve_connection(TokioIo::new(stream), svc)
-                        .await
-                    {
-                        debug!(%peer, error = %e, "tls connection ended");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (tcp, peer) = accepted?;
+                let acceptor = handle.acceptor.read().await.clone();
+                // the permit is held by the spawned task, so the count drops
+                // back as soon as the connection ends
+                let Ok(permit) = slots.clone().try_acquire_owned() else {
+                    debug!(%peer, "connection limit reached, dropping");
+                    continue;
+                };
+                let app = app.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await {
+                        Ok(Ok(stream)) => {
+                            let svc = TowerToHyperService::new(app.clone());
+                            let mut http = http1::Builder::new();
+                            // an explicit timer is required: with one set, a
+                            // configured read timeout is enforced instead of
+                            // warned about and ignored
+                            http.timer(TokioTimer::new());
+                            http.header_read_timeout(HEADER_READ_TIMEOUT);
+                            if let Err(e) = http.serve_connection(TokioIo::new(stream), svc).await {
+                                debug!(%peer, error = %e, "tls connection ended");
+                            }
+                        }
+                        Ok(Err(e)) => debug!(%peer, error = %e, "tls handshake failed"),
+                        Err(_) => debug!(%peer, "tls handshake timed out"),
                     }
-                }
-                Err(e) => debug!(%peer, error = %e, "tls handshake failed"),
+                });
             }
-        });
-
-        since_check += Duration::from_millis(200);
-        if since_check.as_secs() >= cfg.reload_secs.max(10) {
-            since_check = Duration::ZERO;
-            let now = fingerprint(&cfg.cert_path);
-            if now != last {
-                last = now;
-                match load_server_config(&cfg).await {
-                    Ok(sc) => {
-                        *handle.acceptor.write().await =
-                            Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(sc)));
-                        info!("TLS certificate reloaded");
+            _ = reload.tick() => {
+                let now = fingerprint(&cfg.cert_path);
+                if now != last {
+                    last = now;
+                    match load_server_config(&cfg).await {
+                        Ok(sc) => {
+                            *handle.acceptor.write().await =
+                                Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(sc)));
+                            info!("TLS certificate reloaded");
+                        }
+                        Err(e) => warn!(error = %e, "TLS reload failed, keeping the old certificate"),
                     }
-                    Err(e) => warn!(error = %e, "TLS reload failed, keeping the old certificate"),
                 }
             }
         }

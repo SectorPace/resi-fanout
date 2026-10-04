@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
+use anyhow::Context;
 use serde_json::Value;
 use tracing::warn;
 
@@ -15,14 +16,22 @@ pub struct FetchOutcome {
 
 /// Hard cap on rows accepted from a single source.
 const MAX_ROWS_PER_SOURCE: usize = 20_000;
+/// Hard cap on bytes read from a single source body.
+const MAX_BYTES_PER_SOURCE: usize = 32 * 1024 * 1024;
 
-pub fn build_client() -> reqwest::Client {
+/// Build the shared HTTP client.
+///
+/// Returns a `Result` rather than panicking: this is called from inside the
+/// detached `tokio::spawn` that runs a refresh cycle, and a panic there would
+/// kill the task while leaving `AppState::busy` set — wedging every
+/// `/api/refresh` and `/api/check` with 409 for the life of the process.
+pub fn build_client() -> anyhow::Result<reqwest::Client> {
     reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (X11; Linux x86_64) resi-fanout/1.0")
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(3))
         .build()
-        .expect("reqwest client")
+        .context("build reqwest client")
 }
 
 pub async fn fetch_all(client: &reqwest::Client, sources: &[SourceCfg]) -> Vec<FetchOutcome> {
@@ -64,9 +73,9 @@ async fn fetch_one(client: &reqwest::Client, s: &SourceCfg) -> FetchOutcome {
     if !resp.status().is_success() {
         return fail(format!("http status {}", resp.status()));
     }
-    let text = match resp.text().await {
+    let text = match read_capped(resp).await {
         Ok(t) => t,
-        Err(e) => return fail(format!("body: {e}")),
+        Err(e) => return fail(e),
     };
     let mut proxies = match s.kind.as_str() {
         "monosans" => parse_monosans(&text),
@@ -83,6 +92,30 @@ async fn fetch_one(client: &reqwest::Client, s: &SourceCfg) -> FetchOutcome {
         proxies,
         error: None,
     }
+}
+
+/// Read a response body, refusing anything over `MAX_BYTES_PER_SOURCE`.
+///
+/// `Response::text()` buffers the whole body before any limit applies, so a
+/// source serving a huge (or effectively endless, within the client timeout)
+/// payload would allocate until the process died — the row cap below only
+/// limits what we keep, not what we read. Reject on the declared length first,
+/// then enforce the ceiling while streaming.
+async fn read_capped(resp: reqwest::Response) -> Result<String, String> {
+    if let Some(len) = resp.content_length() {
+        if len > MAX_BYTES_PER_SOURCE as u64 {
+            return Err(format!("body too large: {len} bytes"));
+        }
+    }
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("body: {e}"))? {
+        if buf.len() + chunk.len() > MAX_BYTES_PER_SOURCE {
+            return Err(format!("body exceeds {MAX_BYTES_PER_SOURCE} bytes"));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Lines like "1.2.3.4:8080" or "socks5://1.2.3.4:1080 [annotations]".
@@ -131,12 +164,57 @@ fn parse_line(line: &str, default_proto: Option<Protocol>) -> Option<ProxyInfo> 
     })
 }
 
+/// Reject targets we must never dial or fan out.
+///
+/// Proxy lists are third-party data, and every accepted entry becomes both a TCP
+/// connect target and — through the fanout listener — a relay that forwards
+/// arbitrary client traffic to it. Without this check a hostile list (or a
+/// compromised mirror) could point entries at the host's loopback, the LAN, or
+/// a cloud metadata endpoint such as 169.254.169.254, turning the service into
+/// an SSRF pivot. Only literal IPs are judged here; a hostname is filtered at
+/// dial time by the resolved address.
 fn valid_host(h: &str) -> bool {
-    !h.is_empty()
-        && h.len() <= 253
-        && h.contains('.')
-        && h.chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    if h.is_empty() || h.len() > 253 || !h.contains('.') {
+        return false;
+    }
+    if !h
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+    {
+        return false;
+    }
+    match h.parse::<std::net::IpAddr>() {
+        Ok(ip) => is_public_unicast(ip),
+        Err(_) => true, // hostname, not a literal address
+    }
+}
+
+/// True only for globally routable unicast addresses.
+fn is_public_unicast(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_loopback()                 // 127/8
+                || v4.is_private()               // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local()            // 169.254/16 (incl. 169.254.169.254)
+                || v4.is_unspecified()           // 0.0.0.0
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_documentation()         // 192.0.2/24, 198.51.100/24, 203.0.113/24
+                || o[0] == 0                     // 0.0.0.0/8 "this network"
+                || (o[0] == 100 && (o[1] & 0b1100_0000) == 64) // 100.64/10 CGNAT
+                || o[0] >= 240)                  // 240/4 reserved
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                || (s[0] & 0xfe00) == 0xfc00    // fc00::/7 unique-local
+                || (s[0] & 0xffc0) == 0xfe80)   // fe80::/10 link-local
+        }
+    }
 }
 
 fn jstr<'a>(v: &'a Value, key: &str) -> Option<&'a str> {

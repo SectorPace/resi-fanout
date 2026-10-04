@@ -4,11 +4,16 @@ on:
   push:
     tags: ["v*"]
 
+# Least privilege at the top level. The `build` matrix legs only need to read
+# the repo; `contents: write` is granted solely to the `publish` job, which is
+# the only step that actually talks to the Releases API.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -16,8 +21,9 @@ jobs:
           - target: x86_64-unknown-linux-gnu
           - target: aarch64-unknown-linux-gnu
     runs-on: ubuntu-22.04
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Verify tag matches binary version
         run: |
@@ -32,11 +38,11 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: backend
 
@@ -47,6 +53,14 @@ jobs:
           CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
           AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      # Dependency cache, same as ci.yml. Without this every release run does a
+      # cold `npm ci` from the registry.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
 
       - name: Build frontend
         working-directory: frontend
@@ -67,12 +81,68 @@ jobs:
           mkdir -p "$DIR/backend" && cp backend/config.example.json "$DIR/backend/"
           cp install.sh uninstall.sh README.md LICENSE "$DIR/"
           tar czf "$DIR.tar.gz" "$DIR"
-          # 每个架构单独一个 .sha256：矩阵 job 并行上传同名文件会互相覆盖
-          ( cd . && sha256sum "$DIR.tar.gz" > "$DIR.tar.gz.sha256" )
 
-      - name: Upload to release
-        uses: softprops/action-gh-release@v2
+      # Stage the tarball as a workflow artifact instead of publishing it here.
+      # With fail-fast:false a broken arch must not leave a half-populated
+      # public Release behind, so nothing reaches the Releases API until every
+      # matrix leg has succeeded (see the `publish` job).
+      - name: Stage tarball as workflow artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: resi-fanout-${{ matrix.target }}
+          path: resi-fanout-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    # `needs: build` waits on the *whole* matrix, so a partial build never
+    # produces a visible Release.
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: resi-fanout-*
+          merge-multiple: true
+          path: dist
+
+      # 每个架构单独一个 .sha256；在同一目录下计算，文件名与 install.sh 下载的一致
+      - name: Compute sha256 checksums
+        working-directory: dist
+        run: |
+          shopt -s nullglob
+          files=(resi-fanout-*.tar.gz)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::no tarballs were downloaded"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            sha256sum "$f" > "$f.sha256"
+          done
+          ls -l
+
+      - name: Verify every expected asset is present
+        run: |
+          missing=0
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            for ext in .tar.gz .tar.gz.sha256; do
+              if [ ! -f "dist/resi-fanout-$t$ext" ]; then
+                echo "::error::missing dist/resi-fanout-$t$ext"
+                missing=1
+              fi
+            done
+          done
+          [ "$missing" -eq 0 ]
+
+      - name: Create release with all assets
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
-            resi-fanout-*.tar.gz
-            resi-fanout-*.tar.gz.sha256
+            dist/resi-fanout-*.tar.gz
+            dist/resi-fanout-*.tar.gz.sha256
+          fail_on_unmatched_files: true
+          draft: false

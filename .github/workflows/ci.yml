@@ -2,16 +2,33 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'v*']
+      # `branches:` only ever matches refs/heads/*, so the version-sync job's
+      # `startsWith(github.ref, 'refs/tags/v')` guard could not fire from a
+      # branch filter alone. A `tags:` filter is what actually triggers on a
+      # version tag push.
+      tags: ['v*']
   pull_request:
+
+# Least privilege: this workflow only reads the repo. Previously it declared no
+# permissions at all, so it inherited the repo/org default token scope (commonly
+# read/write) while running on untrusted `pull_request` code.
+permissions:
+  contents: read
+
+# Superseded runs are pointless work on every push to the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           workspaces: backend
       - name: Check
@@ -27,8 +44,9 @@ jobs:
   version-sync:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Tag must match backend/Cargo.toml version
         run: |
           TAG="${GITHUB_REF#refs/tags/v}"
@@ -41,9 +59,10 @@ jobs:
 
   frontend:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: npm
@@ -57,8 +76,9 @@ jobs:
 
   shell:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Syntax check
         run: |
           for f in install.sh uninstall.sh scripts/*.sh; do
@@ -66,4 +86,4 @@ jobs:
           done
       - name: Shellcheck
         run: |
-          shellcheck -S warning install.sh uninstall.sh scripts/*.sh || true
+          shellcheck -S warning install.sh uninstall.sh scripts/*.sh

@@ -73,6 +73,44 @@ impl ProxyInfo {
     }
 }
 
+/// What is serving a local fanout port. Closed set, so it is an enum: the
+/// snippet generator and the UI switch on it and a typo must not silently
+/// land in some third state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PortKind {
+    /// free/paid proxy list node
+    #[default]
+    Proxy,
+    /// VPN Gate OpenVPN tunnel
+    Vpngate,
+    /// Anything else, so a file written by another build still loads.
+    #[serde(other)]
+    Unknown,
+}
+
+impl PortKind {
+    /// The wire form, i.e. exactly what the API used to emit as a string.
+    #[allow(dead_code)]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PortKind::Proxy => "proxy",
+            PortKind::Vpngate => "vpngate",
+            PortKind::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<&str> for PortKind {
+    fn from(s: &str) -> Self {
+        match s {
+            "vpngate" => PortKind::Vpngate,
+            "proxy" => PortKind::Proxy,
+            _ => PortKind::Unknown,
+        }
+    }
+}
+
 /// A proxy currently bound to a local fanout port (returned by /api/ports
 /// and consumed by the 3x-ui snippet generator).
 #[derive(Clone, Debug, Serialize)]
@@ -84,7 +122,7 @@ pub struct PortEntry {
     pub latency_ms: Option<u64>,
     pub residential: bool,
     /// "proxy" (free/paid list node) or "vpngate" (openvpn tunnel)
-    pub kind: String,
+    pub kind: PortKind,
 }
 
 /// One VPN Gate relay server, as parsed from the public CSV API.
@@ -128,14 +166,78 @@ impl VpnServer {
     }
 }
 
+/// Lifecycle state of a spawned OpenVPN sidecar tunnel.
+///
+/// Closed set, so it is an enum rather than a `String`: every consumer
+/// compares against a literal, and an unexpected value used to fall into the
+/// "neither" branch (the tunnel was then never rotated and a bogus status was
+/// reported through the API).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelStatus {
+    /// asked to start, no exit address yet
+    #[default]
+    Spawning,
+    /// tunnel up, fanout port bound
+    Up,
+    /// child exited before the deadline, may be retried
+    Down,
+    /// too many attempts, the slot is given up
+    Failed,
+    /// rotated out on purpose (server left the pool, exhausted, …)
+    Rotated,
+    /// exit classified as a datacenter while only_residential is on
+    Blacklisted,
+    /// written by another version of the service: kept instead of failing the
+    /// whole state.json load, and never equal to a known state.
+    #[serde(other)]
+    Unknown,
+}
+
+impl TunnelStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TunnelStatus::Spawning => "spawning",
+            TunnelStatus::Up => "up",
+            TunnelStatus::Down => "down",
+            TunnelStatus::Failed => "failed",
+            TunnelStatus::Rotated => "rotated",
+            TunnelStatus::Blacklisted => "blacklisted",
+            TunnelStatus::Unknown => "unknown",
+        }
+    }
+}
+
+impl From<&str> for TunnelStatus {
+    fn from(s: &str) -> Self {
+        match s {
+            "spawning" => TunnelStatus::Spawning,
+            "up" => TunnelStatus::Up,
+            "down" => TunnelStatus::Down,
+            "failed" => TunnelStatus::Failed,
+            "rotated" => TunnelStatus::Rotated,
+            "blacklisted" => TunnelStatus::Blacklisted,
+            _ => TunnelStatus::Unknown,
+        }
+    }
+}
+
+/// Keeps the historic `t.status == "up"` style comparisons working.
+impl PartialEq<&str> for TunnelStatus {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
 /// Runtime state of one spawned OpenVPN sidecar tunnel.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct VpnTunnel {
     pub server_key: String,
     pub hostname: String,
     pub local_port: u16,
+    /// spawning | up | down | failed | rotated | blacklisted
     #[serde(default)]
-    pub status: String, // spawning | up | down | failed | rotated
+    pub status: TunnelStatus,
     #[serde(default)]
     pub tun_ip: Option<String>,
     #[serde(default)]
