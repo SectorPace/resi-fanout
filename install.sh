@@ -386,7 +386,9 @@ try_issue_cert() {
   # rustls 会因密钥不匹配拒绝加载 → 服务起不来。
   CRT=""; KEY=""
   # 优先：同名成对（取最新修改的一对）
-  for f in $(find "${TLS_DIR}" -type f -name '*.key' 2>/dev/null | while read -r x; do echo "$(stat -c %Y "$x" 2>/dev/null || echo 0) $x"; done | sort -rn | cut -d' ' -f2-); do
+  # 同样用 -print0 传路径：原来的 for f in $(find ... | cut -d' ' -f2-) 会在
+  # 路径含空格时把 mtime 与路径切错。
+  while IFS= read -r -d '' f; do
     grep -q "PRIVATE KEY" "$f" 2>/dev/null || continue
     stem="${f%.key}"
     for c in "${stem}.crt" "${stem}.pem"; do
@@ -394,15 +396,18 @@ try_issue_cert() {
         KEY="$f"; CRT="$c"; break 2
       fi
     done
-  done
+  done < <(find "${TLS_DIR}" -type f -name '*.key' -printf '%T@ %p\0' 2>/dev/null \
+           | sort -zrn | cut -z -d' ' -f2-)
   # 兜底：任意证书 + 任意私钥（内容特征校验）
+  # 用 find -print0 + read -d ''，不要写 for f in $(find ...)：后者按空白切分，
+  # 路径里有空格就会被拆成两段（SC2044）。
   if [ -z "$KEY" ]; then
-    for f in $(find "${TLS_DIR}" -type f \( -name '*.crt' -o -name '*.pem' \) 2>/dev/null); do
-      grep -q "BEGIN CERTIFICATE" "$f" 2>/dev/null && { CRT="$f"; break; }
-    done
-    for f in $(find "${TLS_DIR}" -type f -name '*.key' 2>/dev/null); do
-      grep -q "PRIVATE KEY" "$f" 2>/dev/null && { KEY="$f"; break; }
-    done
+    while IFS= read -r -d '' f; do
+      if grep -q "BEGIN CERTIFICATE" "$f" 2>/dev/null; then CRT="$f"; break; fi
+    done < <(find "${TLS_DIR}" -type f \( -name '*.crt' -o -name '*.pem' \) -print0 2>/dev/null)
+    while IFS= read -r -d '' f; do
+      if grep -q "PRIVATE KEY" "$f" 2>/dev/null; then KEY="$f"; break; fi
+    done < <(find "${TLS_DIR}" -type f -name '*.key' -print0 2>/dev/null)
   fi
   if [ -n "${CRT}" ] && [ -z "${KEY}" ] && command -v openssl >/dev/null 2>&1; then
     openssl pkey -in "${CRT}" -out "${TLS_DIR}/privkey.pem" >/dev/null 2>&1 || true
