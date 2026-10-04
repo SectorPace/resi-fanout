@@ -84,7 +84,24 @@ elif [ "${FROM_SOURCE}" != "1" ]; then
     *)               TGT="" ;;
   esac
   TMP="${TMPROOT}/dl"; mkdir -p "$TMP"
-  REL_URL="https://github.com/${GH_REPO}/releases/latest/download"
+  # 解析最新版本（含 prerelease）：中间的修复版本都标记为 prerelease 后，
+  # releases/latest 会指向正式版 v1.0.0（不含后续修复），所以这里走 API 取最新
+  LATEST_TAG="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${GH_REPO}/releases?per_page=30" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    rels = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+if isinstance(rels, list) and rels:
+    print(rels[0].get("tag_name", ""))
+' 2>/dev/null)"
+  if [ -n "${LATEST_TAG}" ]; then
+    REL_URL="https://github.com/${GH_REPO}/releases/download/${LATEST_TAG}"
+    log "latest release: ${LATEST_TAG}"
+  else
+    REL_URL="https://github.com/${GH_REPO}/releases/latest/download"
+    warn "无法通过 API 解析最新版本，回退到 releases/latest"
+  fi
   if [ -n "${TGT}" ] && curl -fsSL "${REL_URL}/resi-fanout-${TGT}.tar.gz" -o "${TMP}/app.tar.gz" 2>/dev/null; then
     # 供应链防护：先校验 sha256 再执行解压物
     # 区分「哈希不匹配」(篡改/损坏 → 中止) 与「校验和缺失」(旧版本 → 警告放行)
