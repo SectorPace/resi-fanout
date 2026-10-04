@@ -79,7 +79,9 @@ impl Default for FanoutCfg {
             bind: "127.0.0.1".into(),
             base_port: 20000,
             mode: FanoutMode::Socks,
-            max_ports: 100,
+            // keep the default modest; fanout ports are localhost-only, so
+            // raise this in the UI only if you actually need more exits
+            max_ports: 20,
         }
     }
 }

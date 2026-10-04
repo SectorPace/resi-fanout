@@ -15,7 +15,7 @@
     "bind": "127.0.0.1",
     "base_port": 20000,
     "mode": "socks",
-    "max_ports": 100
+    "max_ports": 20
   },
   "checker": {
     "timeout_secs": 8,

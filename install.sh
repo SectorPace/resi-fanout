@@ -573,7 +573,9 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now "${SERVICE}"
+# enable --now 对已在运行的服务不会重启，配置改动（如 TLS/监听地址）不会生效
+systemctl enable "${SERVICE}" >/dev/null 2>&1 || true
+systemctl restart "${SERVICE}"
 
 sleep 2
 if systemctl is-active --quiet "${SERVICE}"; then
@@ -598,6 +600,7 @@ cat <<EOF
 
  next steps:
   1. 公网访问需在云安全组/防火墙放行 ${API_PORT} 端口（仅本机则用 ssh -L ${API_PORT}:127.0.0.1:${API_PORT}）
+     注：扇出的代理端口（20000+）只监听 127.0.0.1，不需要对公网开放；数量可在「配置」页调整
   2. wait for the first fetch+check cycle (~1-3 min), check 总览
   3. integrate with 3x-ui:
      bash ${PREFIX}/scripts/3xui-push.sh \\
