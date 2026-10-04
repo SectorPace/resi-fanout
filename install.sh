@@ -176,15 +176,16 @@ if [ "${WITH_TLS}" = "1" ]; then
   if ! command -v lego >/dev/null 2>&1; then
     log "安装 lego（ACME 客户端，支持 RFC 8738 IP 证书）"
     case "$(uname -m)" in
-      x86_64)        LEGO_URL="https://github.com/go-acme/lego/releases/download/v5.5.2/lego_linux_amd64.tar.gz" ;;
-      aarch64|arm64) LEGO_URL="https://github.com/go-acme/lego/releases/download/v5.5.2/lego_linux_arm64.tar.gz" ;;
+      x86_64)        LEGO_URL="https://github.com/go-acme/lego/releases/download/v5.5.2/lego_v5.5.2_linux_amd64.tar.gz" ;;
+      aarch64|arm64) LEGO_URL="https://github.com/go-acme/lego/releases/download/v5.5.2/lego_v5.5.2_linux_arm64.tar.gz" ;;
       *) die "该架构没有 lego 预编译包，请手动申请证书后把 cert/key 路径填进配置" ;;
     esac
     T="$(mktemp -d)"
     if curl -fsSL "${LEGO_URL}" | tar xz -C "${T}" && [ -f "${T}/lego" ]; then
       install -m 755 "${T}/lego" /usr/local/bin/lego
     else
-      die "lego 下载失败（网络问题？），可手动安装后重试"
+      die "lego 下载失败（404/网络）。手动安装：
+      curl -fsSL ${LEGO_URL} | tar xz -C /usr/local/bin && chmod +x /usr/local/bin/lego"
     fi
   fi
 
