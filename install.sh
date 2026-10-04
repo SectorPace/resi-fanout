@@ -549,7 +549,14 @@ status_panel() {
   if c systemctl && systemctl is-active --quiet "$SVC" 2>/dev/null; then
     blue "服务状态：运行中"
   elif c systemctl; then
-    red "服务状态：未运行（菜单 2 启动）"
+    red "服务状态：未运行（菜单 2 启动，或菜单 11 诊断）"
+    # 启动失败的原因直接摆在菜单里，省得再去翻 journalctl
+    if c journalctl; then
+      local err
+      err="$(journalctl -u "$SVC" -n 30 --no-pager 2>/dev/null \
+        | grep -iE "error|panic|permission|denied|in use|invalid|failed|cannot|no such" | tail -3)"
+      [ -n "$err" ] && while IFS= read -r line; do red "  └ $line"; done <<< "$err"
+    fi
   else
     yellow "服务状态：未知（本机无 systemctl）"
   fi
@@ -582,8 +589,9 @@ do_menu() {
     green " 8. 查看 UI 地址 / API Key"
     green " 9. 更新 resi-fanout"
     yellow " 10. 卸载"
+    green " 11. 诊断（配置/端口/证书/权限 逐项体检）"
     red  " 0. 退出"
-    readp "请输入数字【0-10】：" choice
+    readp "请输入数字【0-11】：" choice
     case "$choice" in
       1) : ;;
       2) svc_ctl start ;;
@@ -599,12 +607,64 @@ k = json.load(open('$CONF'))['server']['api_key']
 print((k[:4] + '****' + k[-4:]) if len(k) > 10 else ('（未设置）' if not k else '****'))" 2>/dev/null)"
          blue "Key：${MASKED}（完整值请执行 rf key）" ;;
       9) curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/install.sh | sudo bash ;;
+      11) doctor ;;
       10) readp "确认卸载？[y/N]：" yn
           [ "$yn" = "y" ] && curl -fsSL https://raw.githubusercontent.com/SectorPace/resi-fanout/main/uninstall.sh | sudo bash && exit 0 ;;
       0|*) exit 0 ;;
     esac
     readp "按回车返回菜单…" _
   done
+}
+
+do_doctor() {
+  red  "~~~~~~~~~~~~~~~~~~~~ 诊断 ~~~~~~~~~~~~~~~~~~~~"
+  local port="" tls_on="no"
+  if [ -f "$CONF" ]; then
+    port="$(python3 -c "import json;print(json.load(open('$CONF'))['server']['listen'].rsplit(':',1)[-1])" 2>/dev/null)"
+    tls_on="$(python3 -c "import json;print('yes' if json.load(open('$CONF'))['server'].get('tls',{}).get('enabled') else 'no')" 2>/dev/null)"
+  fi
+  yellow "1) 二进制";  [ -x /opt/resi-fanout/bin/resi-fanout ] && blue "   $(/opt/resi-fanout/bin/resi-fanout version 2>/dev/null || echo '执行异常')" || red "   缺失"
+  yellow "2) 服务";    if c systemctl; then
+      if systemctl is-active --quiet "$SVC"; then blue "   运行中"; else red "   未运行"; fi
+    else red "   无 systemctl"; fi
+  yellow "3) 配置"
+  if [ -f "$CONF" ]; then
+    blue "   $(ls -l "$CONF" | awk '{print $1, $3, $4}')"
+    if c runuser && runuser -u "$SVC" -- test -r "$CONF" 2>/dev/null; then blue "   服务账号可读 ✓"
+    else red "   服务账号读不到 ✗（会导致启动失败）→ sudo chown root:$SVC $CONF"; fi
+  else red "   配置文件缺失"; fi
+  yellow "4) 监听端口"
+  if [ -n "$port" ] && (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) | grep -q ":${port}[[:space:]]"; then
+    blue "   $( (ss -tln 2>/dev/null || netstat -tln) | grep ":${port}[[:space:]]" | head -1 | awk '{print $4}') 正在监听"
+    (ss -tln 2>/dev/null || netstat -tln) | grep -q "0.0.0.0:${port}[[:space:]]" \
+      && blue "   绑定 0.0.0.0（公网可达）✓" || yellow "   仅绑定 127.0.0.1（公网需隧道或开 0.0.0.0）"
+  else
+    red "   端口 ${port:-?} 没有监听"
+  fi
+  yellow "5) 端口占用"
+  if [ -n "$port" ]; then
+    local holder
+    holder="$(ss -tlnp 2>/dev/null | grep ":${port}[[:space:]]" | grep -o 'users:(("[^"]*"' | head -1 | cut -d'"' -f2)"
+    [ -n "$holder" ] && yellow "   被 ${holder} 占用（如为旧实例需先停掉）" || blue "   无占用"
+  fi
+  yellow "6) TLS 证书（当前配置: ${tls_on}）"
+  local tlsdir="/etc/${SVC%%.*}/tls"
+  if [ -d "$tlsdir" ]; then
+    blue "   $(ls -l "$tlsdir" | tail -n +2 | awk '{print $1, $3, $9}' | tr '\n' ' ')"
+    if c runuser && runuser -u "$SVC" -- test -r "$tlsdir/privkey.pem" 2>/dev/null; then blue "   服务账号可读私钥 ✓"
+    else red "   服务账号读不到 privkey.pem ✗ → sudo chown root:$SVC $tlsdir/privkey.pem"; fi
+  else yellow "   无证书目录（纯 HTTP 部署可忽略）"; fi
+  yellow "7) 数据目录"
+  if c runuser && runuser -u "$SVC" -- touch "$(python3 -c "import json;print(json.load(open('$CONF'))['server']['web_root'])" 2>/dev/null)/../.probe" 2>/dev/null; then
+    blue "   可写 ✓"
+  else
+    red "   服务账号不可写 ✗ → sudo chown -R $SVC:/var/lib/${SVC%%.*}"
+  fi
+  if c journalctl; then
+    yellow "8) 最近错误"
+    journalctl -u "$SVC" -n 8 --no-pager 2>/dev/null | tail -8 | while IFS= read -r line; do red "   $line"; done
+  fi
+  green "诊断结束：把上面的输出反馈即可定位问题"
 }
 
 do_logs() {
@@ -627,6 +687,7 @@ case "${1:-}" in
   status)  status_panel ;;
   start|stop|restart) svc_ctl "$1" ;;
   logs)    shift; do_logs "$@" ;;
+  doctor|diag) do_doctor ;;
   api)     shift; api "${1:-/api/status}" ;;
   ui|url)  ui_url ;;
   key)     python3 -c "import json;print(json.load(open('$CONF'))['server']['api_key'] or '（未设置）')" 2>/dev/null ;;
