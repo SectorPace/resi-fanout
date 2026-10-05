@@ -531,37 +531,42 @@ pub fn load(path: &str) -> anyhow::Result<Config> {
     }
 }
 
+/// First writable directory among a few candidates.
+///
+/// `std::env::temp_dir()` is not reliably writable — WSL images in particular
+/// often mount `/tmp` read-only, which would make every test that needs a
+/// scratch directory fail for a reason unrelated to the code under test.
+#[cfg(test)]
+pub(crate) fn writable_tmpdir(tag: &str) -> std::path::PathBuf {
+    let name = format!(
+        "rf-{tag}-{}-{}",
+        std::process::id(),
+        crate::models::now_ts()
+    );
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for var in ["CARGO_TARGET_TMPDIR", "CARGO_TARGET_DIR"] {
+        if let Ok(p) = std::env::var(var) {
+            if !p.is_empty() {
+                roots.push(std::path::PathBuf::from(p));
+            }
+        }
+    }
+    roots.push(std::env::temp_dir());
+    for root in &roots {
+        let d = root.join(&name);
+        if std::fs::create_dir_all(&d).is_ok() {
+            return d;
+        }
+    }
+    panic!("no writable temp dir among {roots:?}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// First writable directory among a few candidates.
-    ///
-    /// `std::env::temp_dir()` is not reliably writable — WSL images in
-    /// particular often mount `/tmp` read-only, which would make every test here
-    /// fail for a reason that has nothing to do with the code under test.
     fn tmpdir(tag: &str) -> std::path::PathBuf {
-        let name = format!(
-            "rf-cfg-{tag}-{}-{}",
-            std::process::id(),
-            crate::models::now_ts()
-        );
-        let mut roots: Vec<std::path::PathBuf> = Vec::new();
-        for var in ["CARGO_TARGET_TMPDIR", "CARGO_TARGET_DIR"] {
-            if let Ok(p) = std::env::var(var) {
-                if !p.is_empty() {
-                    roots.push(std::path::PathBuf::from(p));
-                }
-            }
-        }
-        roots.push(std::env::temp_dir());
-        for root in &roots {
-            let d = root.join(&name);
-            if std::fs::create_dir_all(&d).is_ok() {
-                return d;
-            }
-        }
-        panic!("no writable temp dir among {roots:?}");
+        writable_tmpdir(&format!("cfg-{tag}"))
     }
 
     #[test]

@@ -553,7 +553,7 @@ async fn xui_inbounds(State(state): State<Arc<AppState>>) -> Response {
     match crate::xui::run_script(&cfg.xui, &arg_refs).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => {
-            let msg = format!("{e}（已探测: {}）", crate::xui::probed_paths(&cfg.xui));
+            let msg = crate::xui::not_found_message(&e, &cfg.xui);
             (StatusCode::BAD_REQUEST, msg).into_response()
         }
     }
@@ -601,7 +601,14 @@ async fn xui_preview(
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     match crate::xui::run_script(&cfg.xui, &arg_refs).await {
         Ok(v) => Json(v).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+        // Same enriched message as the list route: which paths were searched,
+        // and whether the file is missing or merely unreadable. Bare `{e}` here
+        // sent operators looking for a file that was actually present.
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            crate::xui::not_found_message(&e, &cfg.xui),
+        )
+            .into_response(),
     }
 }
 
@@ -663,7 +670,11 @@ async fn xui_unlink(State(state): State<Arc<AppState>>) -> Response {
             }
             Json(v).into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, format!("{e}")).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            crate::xui::not_found_message(&e, &cfg.xui),
+        )
+            .into_response(),
     }
 }
 

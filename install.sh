@@ -928,6 +928,43 @@ fi
 log "writing systemd unit ${SERVICE}"
 # VPN Gate / WARP tunnels need NET_ADMIN (openvpn is installed by default)
 CAPS=$'AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW\nCapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW'
+
+# 3x-ui 联动要写面板数据库，而 ProtectSystem=strict 会把 ReadWritePaths 之外的
+# 整个文件系统挂成只读。SQLite 还会在库文件旁边创建 -wal/-shm/journal，所以必须
+# 放行的是**目录**而不是文件本身。
+#
+# 两条必须遵守的约束：
+#   1) ReadWritePaths 里写一个不存在的路径，systemd 会直接启动失败
+#      （Failed to set up mount namespacing: ... No such file or directory），
+#      所以只放行确实存在的目录。
+#   2) 这解决的是「文件系统只读」；服务用户本身还需要对该文件有读写权限，
+#      那是另一回事（面板库通常是 root:root + 0600）。两件事都得做。
+XUI_DB_CFG=""
+if [ -f "${CONF_DIR}/config.json" ]; then
+  XUI_DB_CFG="$(python3 - "${CONF_DIR}/config.json" <<'PYXUIDB' 2>/dev/null || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("xui", {}).get("db_path", ""))
+except Exception:
+    print("")
+PYXUIDB
+)"
+fi
+XUI_RW=""
+for cand in "${XUI_DB_CFG}" \
+            /etc/x-ui/x-ui.db /etc/x-ui/db/x-ui.db \
+            /usr/local/x-ui/x-ui.db /usr/local/x-ui/bin/x-ui.db \
+            /usr/local/x-ui/bin/db/x-ui.db \
+            /opt/x-ui/x-ui.db /opt/x-ui/db/x-ui.db; do
+  [ -n "${cand}" ] && [ -f "${cand}" ] || continue
+  xui_dir="$(dirname -- "${cand}")"
+  case " ${XUI_RW} " in
+    *" ${xui_dir} "*) continue ;;
+  esac
+  XUI_RW="${XUI_RW:+${XUI_RW} }${xui_dir}"
+done
+[ -n "${XUI_RW}" ] && log "3x-ui 面板库目录已加入 ReadWritePaths：${XUI_RW}"
+
 cat > "/etc/systemd/system/${SERVICE}" <<EOF
 [Unit]
 Description=Resi-Fanout: residential proxy fanout for 3x-ui
@@ -945,7 +982,7 @@ NoNewPrivileges=true
 ${CAPS}
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=${DATA_DIR} ${CONF_DIR}
+ReadWritePaths=${DATA_DIR} ${CONF_DIR}${XUI_RW:+ ${XUI_RW}}
 PrivateTmp=true
 
 [Install]
