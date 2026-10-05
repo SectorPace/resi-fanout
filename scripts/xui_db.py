@@ -24,7 +24,6 @@ import base64
 import json
 import os
 import re
-import shutil
 import sqlite3
 import sys
 import time

@@ -155,3 +155,11 @@ jobs:
             dist/resi-fanout-*.tar.gz.sha256
           fail_on_unmatched_files: true
           draft: false
+          # Both must be explicit. The action's default is `prerelease: auto`,
+          # which guessed `true` for v1.0.2 and marked the release a prerelease —
+          # so GitHub refused to make it "Latest" and install.sh's
+          # `releases/latest` fallback would have kept serving an older version.
+          # A patch release on the stable line is never a prerelease, and this
+          # tag is by construction the newest release.
+          prerelease: false
+          make_latest: true
