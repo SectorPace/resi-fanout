@@ -337,9 +337,18 @@ async fn reconcile(state: &Arc<AppState>, cfg: &crate::config::Config, running: 
 /// takeover. Grouped by what they would let the server do.
 const FORBIDDEN_DIRECTIVES: &[&str] = &[
     // run arbitrary programs
-    "up", "down", "route-up", "ipchange", "client-connect", "learn-address",
-    "tls-verify", "crl-verify", "plugin", "config", "cd", "chroot", "daemon",
-    "askpass",
+    "up", "down", "route-up", "route-pre-down", "ipchange", "client-connect",
+    "client-disconnect", "learn-address", "tls-verify", "crl-verify", "plugin",
+    "config", "cd", "chroot", "daemon", "askpass",
+    // more script hooks: `auth-user-pass-verify via <script>` shells out to
+    // verify credentials, `dns-updown` runs as the platform DNS hook, and
+    // `tls-crypt-v2-verify` runs a command on the client-supplied metadata.
+    // All reachable with `script-security 2`.
+    "auth-user-pass-verify", "tls-crypt-v2-verify", "dns-updown",
+    // dlopen an attacker-named shared object, which is equivalent to running it:
+    // `providers` takes OpenSSL provider paths, `pkcs11-providers` a PKCS#11
+    // module path (Debian builds openvpn with ENABLE_PKCS11).
+    "providers", "pkcs11-providers",
     // environment / privileges / config we own
     "setenv", "setenv-safe", "script-security", "user", "group", "auth-user-pass",
     // take over host routing (we use route-nopull + `ip rule from ... table N`)
@@ -373,19 +382,68 @@ fn inline_tag_open(line: &str) -> Option<String> {
     INLINE_TAGS.contains(&tag.as_str()).then_some(tag)
 }
 
+/// C-locale `isspace()`, which is what OpenVPN's own option scanner uses to
+/// find parameter boundaries (`space()` in `src/openvpn/options.c`).
+///
+/// Deliberately not `char::is_whitespace` (that also matches Unicode spaces,
+/// which can never reach us) and deliberately not `u8::is_ascii_whitespace`
+/// (that set *omits* `\v`, which C's `isspace()` includes).
+fn is_openvpn_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\u{b}' | '\u{c}' | '\r')
+}
+
+/// The first parameter of a config line, the way OpenVPN's `parse_line` sees
+/// it: boundaries are C-locale whitespace, and one layer of surrounding `"`
+/// or `'` is stripped.
+///
+/// Both details are load-bearing, and getting either wrong is remote code
+/// execution rather than a cosmetic miss. The config arrives base64-encoded
+/// inside a third-party HTTP response and is handed to openvpn with
+/// `script-security 2` and full `CAP_NET_ADMIN`. Splitting only on `' '`/`'\t'`
+/// made `up\u{c}/tmp/evil.sh` a single opaque token — absent from
+/// `FORBIDDEN_DIRECTIVES`, copied through verbatim — while OpenVPN still read
+/// it as `up /tmp/evil.sh` and executed the script. The same held for
+/// `"up" /tmp/evil.sh` and every other quoted spelling of a forbidden name.
+fn first_param(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut quote: Option<char> = None;
+    let mut started = false;
+    for c in s.chars() {
+        match quote {
+            // closing quote: ends the parameter's quoting, adds nothing
+            Some(q) if c == q => quote = None,
+            Some(_) => out.push(c),
+            // opening quote: starts a parameter but is not part of it
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                started = true;
+            }
+            None if is_openvpn_space(c) => {
+                if started {
+                    break;
+                }
+            }
+            None => {
+                out.push(c);
+                started = true;
+            }
+        }
+    }
+    started.then_some(out)
+}
+
 /// The directive name of one OpenVPN config line, lowercased, or `None` for
 /// blanks/comments.
 ///
-/// Handles the two shapes that made a naive `starts_with("up ")` unsafe:
-/// arbitrary runs of spaces/tabs between the directive and its first argument,
-/// and the optional `--` prefix that OpenVPN also accepts in config files.
+/// Tokenized by [`first_param`] so that it agrees with OpenVPN on where a
+/// directive name ends; see the warning there.
 fn directive_of(line: &str) -> Option<String> {
-    let t = line.trim_start_matches([' ', '\t']);
+    let t = line.trim_start_matches(is_openvpn_space);
     if t.is_empty() || t.starts_with('#') || t.starts_with(';') {
         return None;
     }
     let t = t.strip_prefix("--").unwrap_or(t);
-    let tok = t.split([' ', '\t']).next()?;
+    let tok = first_param(t)?;
     if tok.is_empty() {
         None
     } else {
@@ -611,6 +669,82 @@ mod tests {
                 "directive survived sanitizing: {line:?}"
             );
         }
+    }
+
+    #[test]
+    fn drops_directives_split_by_any_c_isspace_or_hidden_in_quotes() {
+        // Regression: the sanitizer used to split only on ' ' and '\t' and
+        // never dequoted, so these all produced a single opaque token that was
+        // absent from FORBIDDEN_DIRECTIVES — while OpenVPN's own `parse_line`
+        // (space() == C isspace(), plus quote stripping) read the directive as
+        // `up` and executed the script. With script-security 2 and
+        // CAP_NET_ADMIN that is RCE as the service user, driven by a hostile
+        // VPN Gate mirror, so these must not be spellings that get through.
+        for line in [
+            "up\u{b}/tmp/evil.sh",   // \v
+            "up\u{c}/tmp/evil.sh",   // \f
+            "up\r/tmp/evil.sh",      // \r
+            "\"up\" /tmp/evil.sh",
+            "'up' /tmp/evil.sh",
+            "\"\"up\"\" /tmp/evil.sh",
+            "--\"down\" /tmp/evil.sh",
+            "\u{b}\u{b}up /tmp/evil.sh",
+            // same trick applied to the other exec/dlopen directives
+            "\u{c}plugin /tmp/evil.so",
+            "\"config\" /tmp/other.conf",
+            "\ruser root",
+        ] {
+            assert!(
+                kept(line).trim().is_empty(),
+                "directive survived sanitizing: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn drops_the_lesser_known_exec_and_dlopen_hooks() {
+        // Every one of these runs a program or loads an attacker-named shared
+        // object under `script-security 2`. They are easy to omit because they
+        // are documented as platform/verification hooks rather than as the
+        // headline up/down pair.
+        for line in [
+            "route-pre-down /tmp/evil.sh",
+            "client-disconnect /tmp/evil.sh",
+            "tls-crypt-v2-verify /tmp/evil.sh",
+            "dns-updown /tmp/evil.sh",
+            "auth-user-pass-verify /tmp/verify.sh via",
+            "providers /tmp/evil.so",
+            "pkcs11-providers /tmp/evil.so",
+        ] {
+            assert!(
+                kept(line).trim().is_empty(),
+                "directive survived sanitizing: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn first_param_matches_openvpn_tokenization() {
+        // Sanity-check the tokenizer directly against the shapes that matter.
+        assert_eq!(first_param("up /tmp/evil.sh").as_deref(), Some("up"));
+        assert_eq!(first_param("up\u{c}/tmp/evil.sh").as_deref(), Some("up"));
+        assert_eq!(first_param("up\r/tmp/evil.sh").as_deref(), Some("up"));
+        assert_eq!(first_param("\"up\" /tmp/evil.sh").as_deref(), Some("up"));
+        assert_eq!(first_param("''up'' x").as_deref(), Some("up"));
+        // whitespace *inside* quotes is part of the parameter, exactly as OpenVPN
+        // reads it, so `"<tab>up<tab>"` is one directive literally named
+        // "\tup\t" — which OpenVPN rejects as unrecognised rather than running
+        // as `up`. Same for an unterminated quote. Neither is a bypass, and
+        // the important property is that they can't collapse to `up`.
+        assert_eq!(first_param("\"\tup\t\" x").as_deref(), Some("\tup\t"));
+        assert!(!FORBIDDEN_DIRECTIVES.contains(&first_param("\"\tup\t\" x").unwrap().to_ascii_lowercase().as_str()));
+        assert_eq!(first_param("\"up /tmp/evil.sh").as_deref(), Some("up /tmp/evil.sh"));
+        assert!(!FORBIDDEN_DIRECTIVES.contains(&first_param("\"up /tmp/evil.sh").unwrap().to_ascii_lowercase().as_str()));
+        // leading separators produce no parameter at all
+        assert_eq!(first_param("   "), None);
+        // a real directive whose *argument* is named `up` is untouched
+        assert_eq!(directive_of("remote up.example.com 1194").as_deref(), Some("remote"));
+        assert_eq!(directive_of("remote \"up.example.com\" 1194").as_deref(), Some("remote"));
     }
 
     #[test]

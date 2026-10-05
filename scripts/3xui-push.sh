@@ -87,8 +87,14 @@ print(f'CONF_API={shlex.quote(scheme + "://127.0.0.1:" + port + base)}')
 print(f'CONF_KEY={shlex.quote(cfg.get("api_key", "") or "")}')
 PYEOF2
 )"
-  API="${1:-${CONF_API}}"
-  KEY="${RF_KEY:-${CONF_KEY}}"
+  # ${CONF_API:-} / ${CONF_KEY:-} rather than ${CONF_API}: if the python above
+  # exits non-zero (truncated/corrupt config, unreadable file, an old python3)
+  # the eval consumes nothing, the variables are never assigned, and `set -u`
+  # then aborts with a bare "CONF_API: unbound variable" — which also made the
+  # deliberate `|| API="http://127.0.0.1:7654"` fallback below unreachable, so a
+  # corrupt config looked identical to an unreachable API.
+  API="${1:-${CONF_API:-}}"
+  KEY="${RF_KEY:-${CONF_KEY:-}}"
   unset CONF_API CONF_KEY
   log "自动读取到 API: ${API}"
 fi
@@ -126,17 +132,32 @@ BACKUP="${DB}.bak.$(date +%Y%m%d%H%M%S)"
 # backup that is not the database. VACUUM INTO exports a consistent snapshot
 # (same approach, and same reason, as scripts/xui_db.py).
 if ! python3 - "${DB}" "${BACKUP}" <<'PYBAK'
-import shutil, sqlite3, sys
+import os, sqlite3, sys
 
 db, bak = sys.argv[1], sys.argv[2]
+# sqlite3's own backup API, for the same reasons as scripts/xui_db.py: a bare
+# copy of the main file misses every uncheckpointed -wal transaction, so the
+# "backup" is not the database; and VACUUM INTO needs SQLite >= 3.27 (CentOS 7
+# has 3.7.17) and fails outright when the target already exists — which it does
+# on a same-second rerun, because the name has only second resolution. The old
+# code swallowed both and degraded to copy2.
 try:
-    sqlite3.connect(db).execute("VACUUM INTO ?", (bak,))
-except sqlite3.Error:
-    # Degraded path (e.g. the db is locked): at least keep the main file.
-    shutil.copy2(db, bak)
+    if os.path.exists(bak):
+        os.unlink(bak)
+    dst = sqlite3.connect(bak)
+    try:
+        sqlite3.connect(db).backup(dst)
+    finally:
+        dst.close()
+except (sqlite3.Error, OSError) as exc:
+    print(f"backup failed: {exc}", file=sys.stderr)
+    sys.exit(1)
+if not os.path.exists(bak) or os.path.getsize(bak) == 0:
+    print("backup is empty", file=sys.stderr)
+    sys.exit(1)
 PYBAK
 then
-  die "cannot create a backup of ${DB} — refusing to modify the panel database"
+  die "cannot create a usable backup of ${DB} — refusing to modify the panel database"
 fi
 log "backup written: ${BACKUP}"
 

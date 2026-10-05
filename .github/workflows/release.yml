@@ -10,6 +10,15 @@ on:
 permissions:
   contents: read
 
+# Serialize release runs per tag. Force-moving a tag (or re-running) fires a new
+# run, and two `publish` jobs writing the same asset names concurrently can
+# interleave and leave a partial asset set on the Release.
+# Deliberately NOT cancel-in-progress: cancelling a run that is midway through
+# uploading assets would orphan exactly that partial state.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     permissions:

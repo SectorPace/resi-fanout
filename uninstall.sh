@@ -46,8 +46,13 @@ cleanup_runtime() {
 command -v ip >/dev/null 2>&1 && cleanup_runtime || true
 
 rm -rf "${PREFIX}"
-# 临时目录（安装脚本已加 trap，这里兜底旧版本残留）
-rm -rf /tmp/tmp.* 2>/dev/null || true
+# 不要在这里 `rm -rf /tmp/tmp.*`。`mktemp -d` 不带模板时的默认名字恰好就是
+# /tmp/tmp.XXXXXXXXXX，所以那个 glob 匹配的是**本机上任何**并发进程的临时工作
+# 目录——另一个安装器、pip/virtualenv 的暂存、tar 解包、systemd-tmpfiles、
+# CI 步骤——以 root 身份无提示删除别人正在进行中的文件。
+# 而且它本来也帮不上忙：uninstall 是独立进程，install.sh 自己的 TMPROOT 由
+# 它开头的 `trap cleanup EXIT` 负责清理，这个 glob 既定位不到我们的目录，
+# 也清理不了另一个进程里的那一个。
 
 if [ "${PURGE}" = "1" ]; then
   rm -rf "${CONF_DIR}" "${DATA_DIR}"

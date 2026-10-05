@@ -255,13 +255,17 @@ fn parse_monosans(text: &str) -> Vec<ProxyInfo> {
         Ok(v) => v,
         Err(_) => return vec![],
     };
+    // Borrow rather than clone: `v` is owned here and dead after this, and the
+    // clone doubled peak memory for the largest input path — with a 32 MiB
+    // per-source cap, a hostile or hijacked source could already force a ~32 MiB
+    // Value tree, and the caps in fetch_one only run after this returns.
     let arr = match v.as_array() {
-        Some(a) => a.clone(),
+        Some(a) => a,
         None => return vec![],
     };
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for e in &arr {
+    for e in arr.iter() {
         let Some(ip) = jstr(e, "ip").or_else(|| jstr(e, "host")) else {
             continue;
         };
@@ -341,12 +345,12 @@ fn parse_geonode(text: &str) -> Vec<ProxyInfo> {
         Err(_) => return vec![],
     };
     let arr = match v.get("data").and_then(|d| d.as_array()) {
-        Some(a) => a.clone(),
+        Some(a) => a,
         None => return vec![],
     };
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for e in &arr {
+    for e in arr.iter() {
         let Some(ip) = jstr(e, "ip") else { continue };
         let Some(port) = jnum(e, "port") else { continue };
         let proto = e

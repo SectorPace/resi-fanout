@@ -135,14 +135,25 @@ pub async fn serve(
             _ = reload.tick() => {
                 let now = fingerprint(&cfg.cert_path);
                 if now != last {
-                    last = now;
                     match load_server_config(&cfg).await {
                         Ok(sc) => {
+                            // Record the fingerprint only on success. Setting it
+                            // before the attempt meant a failed reload was never
+                            // retried: `fingerprint` is just (len, mtime) of the
+                            // cert file, so after a failure every later tick saw
+                            // `now == last` and skipped the branch entirely.
+                            // That matters for the ACME IP-certificate flow this
+                            // exists for — renewal writes cert and key as a pair,
+                            // so a tick landing between the two writes reads a
+                            // mismatched key, and the service then keeps serving
+                            // the *old* (soon expired) certificate for the rest of
+                            // the window behind a single warn.
+                            last = now;
                             *handle.acceptor.write().await =
                                 Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(sc)));
                             info!("TLS certificate reloaded");
                         }
-                        Err(e) => warn!(error = %e, "TLS reload failed, keeping the old certificate"),
+                        Err(e) => warn!(error = %e, "TLS reload failed, keeping the old certificate; will retry"),
                     }
                 }
             }

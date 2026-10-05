@@ -120,9 +120,23 @@ export interface TlsCfg {
   reload_secs: number;
 }
 
+export interface WarpCfg {
+  enabled: boolean;
+  conf_path: string;
+  interface: string;
+  local_port: number;
+  auto_register: boolean;
+  license: string;
+  keepalive: number;
+  mtu: number;
+  mihomo_bin: string;
+  mihomo_port: number;
+  mihomo_conf: string;
+}
+
 export interface Config {
   server: { listen: string; api_key: string; web_root: string; base_path: string; tls: TlsCfg };
-  fanout: { bind: string; base_port: number; mode: string; max_ports: number };
+  fanout: { bind: string; base_port: number; mode: string; max_ports: number; auto_assign: boolean };
   checker: {
     timeout_secs: number;
     concurrency: number;
@@ -141,6 +155,10 @@ export interface Config {
     only_residential: boolean;
     api_url: string;
     scripts_dir: string;
+    cache_days: number;
+    max_pool: number;
+    mirror_urls: string[];
+    extra_urls: string[];
   };
   xui: {
     db_path: string;
@@ -151,6 +169,7 @@ export interface Config {
     host: string;
     auto_restart: boolean;
   };
+  warp: WarpCfg;
   sources: { name: string; kind: string; url: string; protocol: string | null; enabled: boolean }[];
 }
 

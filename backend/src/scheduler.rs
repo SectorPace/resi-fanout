@@ -32,10 +32,24 @@ impl Drop for BusyGuard {
     }
 }
 
+/// Minimum gap between state saves, and the ceiling the failure backoff grows
+/// towards. The floor doubles on every consecutive failure and resets on the
+/// first success, so a transient error costs one short delay while a permanent
+/// one settles at `SAVE_CEILING` instead of retrying every 30 seconds forever.
+const SAVE_FLOOR: Duration = Duration::from_secs(30);
+const SAVE_CEILING: Duration = Duration::from_secs(3600);
+
 pub fn spawn(state: Arc<AppState>) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(10));
         let mut last_save = std::time::Instant::now() - Duration::from_secs(60);
+        // Backoff for a *persistently* failing save. `dirty` must stay set (see
+        // below), so without this a read-only/full data_dir — or one the service
+        // user lost write access to after the install-time chown — re-serialises
+        // the entire multi-MB pool and retries every 30s forever, flooding the
+        // journal with one warn per attempt.
+        let mut save_fails: u32 = 0;
+        let mut save_backoff = SAVE_FLOOR;
         loop {
             tick.tick().await;
             // a check round dirties the state constantly; with a few thousand
@@ -44,14 +58,25 @@ pub fn spawn(state: Arc<AppState>) {
             // `dirty` is only consumed once a save actually succeeded: clearing
             // it up front dropped the pending change whenever save_state()
             // failed (full disk, EACCES) with nothing left to retry from.
-            if last_save.elapsed() >= Duration::from_secs(30) && state.dirty.load(Ordering::Relaxed)
+            if last_save.elapsed() >= save_backoff && state.dirty.load(Ordering::Relaxed)
             {
                 match state.save_state().await {
                     Ok(()) => {
                         state.dirty.store(false, Ordering::Relaxed);
                         last_save = std::time::Instant::now();
+                        save_fails = 0;
+                        save_backoff = SAVE_FLOOR;
                     }
-                    Err(e) => warn!(error = %e, "state save failed, keeping dirty flag to retry"),
+                    Err(e) => {
+                        save_fails = save_fails.saturating_add(1);
+                        save_backoff = (save_backoff * 2).min(SAVE_CEILING);
+                        warn!(
+                            error = %e,
+                            consecutive_failures = save_fails,
+                            next_retry_secs = save_backoff.as_secs(),
+                            "state save failed; keeping dirty flag and backing off"
+                        );
+                    }
                 }
             }
             let cfg = state.config().await;

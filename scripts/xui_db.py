@@ -43,6 +43,43 @@ def ok(**kw):
     sys.exit(0)
 
 
+def snapshot(conn, db_path, backup):
+    """Write a *consistent* copy of the panel database to `backup`.
+
+    Why not the obvious two options:
+
+    * `shutil.copy2(db_path, backup)` — on a WAL database the main file alone
+      predates every uncheckpointed transaction, so the "backup" is missing
+      committed rows. It was the old fallback, i.e. the guarantee that exists so
+      a failed write is recoverable silently produced something that is not.
+    * `VACUUM INTO` — a correct snapshot, but it only exists from SQLite 3.27
+      (CentOS 7 ships 3.7.17, which install.sh claims to support) and it raises
+      `output file already exists` when the target is present. The backup name
+      has only second resolution, so two runs in the same second degrade
+      silently. Both cases were swallowed by a bare `except sqlite3.Error`,
+      after which the failure message advertised the broken file as the
+      recovery point.
+
+    `Connection.backup` is available on every supported SQLite, includes WAL
+    content, and gives a consistent snapshot of a live database. A pre-existing
+    target is removed first so a same-second rerun cannot half-overwrite. If the
+    snapshot cannot be taken we abort: continuing would mutate the panel with no
+    way back.
+    """
+    try:
+        if os.path.exists(backup):
+            os.unlink(backup)
+        dst = sqlite3.connect(backup)
+        try:
+            conn.backup(dst)
+        finally:
+            dst.close()
+    except (sqlite3.Error, OSError) as exc:
+        die(f"panel database backup failed, refusing to modify {db_path}: {exc}")
+    if not os.path.exists(backup) or os.path.getsize(backup) == 0:
+        die(f"panel database backup is empty, refusing to modify {db_path}")
+
+
 def columns(conn, table):
     cur = conn.execute(f"PRAGMA table_info({table})")
     return [r[1] for r in cur.fetchall()]
@@ -120,7 +157,18 @@ def build_link(row, port, remark, host):
             params["serviceName"] = grpc["serviceName"]
     if security == "reality" and reality.get("publicKey"):
         params["pbk"] = reality["publicKey"]
-        params["fp"] = reality.get("shortIds", ["chrome"])[0] if isinstance(reality.get("shortIds"), list) else "chrome"
+        # `dict.get(key, default)` only applies the default when the key is
+        # ABSENT, so `"shortIds": []` (a realistic state after an operator clears
+        # the field in the panel) indexed an empty list and killed the whole
+        # run with IndexError -- even though build_link documents itself as
+        # best-effort. `or` also covers a present-but-empty value. The sni
+        # handling above already guards the same way.
+        short_ids = reality.get("shortIds")
+        params["fp"] = (
+            short_ids[0]
+            if isinstance(short_ids, list) and short_ids
+            else "chrome"
+        )
     if sni:
         params["sni"] = sni
 
@@ -151,6 +199,19 @@ def build_link(row, port, remark, host):
 
 def list_inbounds(conn):
     cols = columns(conn, "inbounds")
+    if "id" not in cols:
+        # A wrong --db used to build `SELECT  FROM inbounds` (empty column list)
+        # and surface as `near "FROM": syntax error`. Say what is actually wrong.
+        found = [
+            r[0]
+            for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        ]
+        die(
+            "no `inbounds` table with an `id` column in this database "
+            f"(tables: {', '.join(found) or 'none'}) — is this a 3x-ui panel database?"
+        )
     want = [c for c in ("id", "tag", "remark", "port", "protocol", "enable") if c in cols]
     rows = conn.execute(f"SELECT {','.join(want)} FROM inbounds ORDER BY id").fetchall()
     clients_tbl, client_cols = find_clients_table(conn)
@@ -259,6 +320,14 @@ def do_link(args):
         remark = f"resi-{cc}-{port}({kind})"
         while next_port in used_ports:
             next_port += 1
+        # Same bound the *fanout* port above already enforces. Without it a
+        # --inbound-port-base of 70000 (or -5) was written straight into
+        # inbounds.port and the panel then mis-bound or rejected it.
+        if not (1 <= next_port <= 65535):
+            die(
+                f"ran out of usable inbound ports at {next_port} "
+                f"(base {args.inbound_port_base}); lower --inbound-port-base"
+            )
         used_ports.add(next_port)
         plan.append(
             {
@@ -277,12 +346,7 @@ def do_link(args):
         return ok(plan=plan, template=template.get("remark") or template.get("tag"))
 
     backup = f"{args.db}.bak.{time.strftime('%Y%m%d%H%M%S')}"
-    # 面板运行中可能处于 WAL 模式，直接 cp 主库会漏掉 -wal 里的数据；
-    # VACUUM INTO 导出的是一致快照
-    try:
-        conn.execute("VACUUM INTO ?", (backup,))
-    except sqlite3.Error:
-        shutil.copy2(args.db, backup)
+    snapshot(conn, args.db, backup)
 
     created = []
     try:
@@ -369,12 +433,7 @@ def do_unlink(args):
 
     # 与 do_link 一致：先备份，任何失败都不留下写坏的面板库
     backup = f"{args.db}.bak.{time.strftime('%Y%m%d%H%M%S')}"
-    # 面板运行中可能处于 WAL 模式，直接 cp 主库会漏掉 -wal 里的数据；
-    # VACUUM INTO 导出的是一致快照
-    try:
-        conn.execute("VACUUM INTO ?", (backup,))
-    except sqlite3.Error:
-        shutil.copy2(args.db, backup)
+    snapshot(conn, args.db, backup)
 
     removed_tags = [r["tag"] for r in rows]
     ids = [r["id"] for r in rows]
@@ -455,4 +514,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # Every subcommand documents "prints one JSON object to stdout", and
+    # 3xui-push.sh pipes that into `python3 -m json.tool`. Without this wrapper
+    # any sqlite3/json error escaped as a raw traceback on stderr with nothing
+    # on stdout — e.g. `list --db <wrong-file>` builds `SELECT  FROM inbounds`
+    # (empty column list) and dies with a syntax error, and `link --entries
+    # 'not-json'` raised an uncaught JSONDecodeError. Both are ordinary operator
+    # mistakes, so they must come back as a readable message, not a stack trace.
+    try:
+        main()
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001
+        die(f"{type(exc).__name__}: {exc}")

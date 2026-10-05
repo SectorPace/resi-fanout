@@ -229,11 +229,12 @@ sudo bash install.sh --with-masque   # 顺便下载 mihomo（原生 MASQUE 实�
 |---|---|---|
 | `server.listen` | `127.0.0.1:7654` | API/UI 监听地址 |
 | `server.api_key` | 安装时随机 | 非空则所有 `/api` 需 `Authorization: Bearer` |
-| `fanout.bind` / `base_port` / `max_ports` | `127.0.0.1` / `20000` / `100` | 扇出端口范围 |
+| `fanout.bind` / `base_port` / `max_ports` | `127.0.0.1` / `20000` / `20` | 扇出端口范围 |
 | `fanout.mode` | `socks` | 本地口协议：`socks` / `http` / `mixed` |
+| `fanout.auto_assign` | `true` | `true` = 由服务自动为可用代理分配本地端口；`false` = 只使用你在 UI「端口」页手动指定的端口（代理不再被自动占用） |
 | `filter.only_residential` | `false` | **只把住宅 IP 扇出成端口** |
 | `filter.countries` | `[]` | 国家白名单，如 `["US","JP"]` |
-| `checker.timeout_secs` / `concurrency` | `8` / `256` | 检测超时与并发 |
+| `checker.timeout_secs` / `concurrency` | `8` / `256` | 检测超时与并发上限。它只限制**同时在飞**的检测数，并不决定一轮多快：对真正打到接口的代理，ip-api 免费额度的**每分钟请求数**（约 45 次/分）才是瓶颈，超出只会收到 429，而 429 不会被当成「代理已死」，所以调高是安全的。调高仍然值得——**超时**的代理根本没打到接口、不消耗额度，4000 个死节点在 256 并发下约 2 分钟扫完，32 并发则要约 17 分钟。要真正加速分类，请把 `classify_url` 指向额度更高的接口。 |
 | `scheduler.refresh_minutes` | `30` | 抓取周期（0=关闭调度） |
 | `scheduler.recheck_minutes` | `20` | 全池复检周期 |
 | `sources[]` | 9 个免费源 | `kind`: `text` / `monosans` / `geonode` |
@@ -241,6 +242,11 @@ sudo bash install.sh --with-masque   # 顺便下载 mihomo（原生 MASQUE 实�
 | `vpngate.cache_days` / `max_pool` / `extra_urls` | `30` / `800` / `[]` | 节点累积天数、池上限、额外 OVPN 源 |
 | `xui.db_path` / `script_path` | `/etc/x-ui/x-ui.db` | 面板数据库与联动脚本路径 |
 | `xui.inbound_port_base` / `host` | `31000` / `127.0.0.1` | 联动入站起始端口、客户端链接域名 |
+| `warp.enabled` / `local_port` | `false` / `22000` | Cloudflare WARP 隧道开关与本地 SOCKS 端口 |
+| `warp.conf_path` / `interface` | `/var/lib/resi-fanout/warp/warp.conf` / `warp-rf` | WireGuard 配置与托管网卡名 |
+| `warp.auto_register` / `license` | `true` / 空 | 无配置时是否自动 `wgcf register`；WARP+ 授权码 |
+| `warp.mihomo_bin` / `mihomo_port` / `mihomo_conf` | `mihomo` / `22100` | MASQUE 节点的 Mihomo 边车二进制、mixed 端口与配置（`--with-masque` 安装后生效） |
+| `warp.masque_port` | `22200` | MASQUE 隧道对外的扇出端口。**必须与 `mihomo_port` 不同**：边车自己已经占用 `mihomo_port`，共用会导致两边抢同一个端口 |
 
 > **关于"住宅代理"**：免费列表里绝大多数是机房 IP，本项目靠 `ip-api.com` 的 `hosting` 标志把住宅/家宽节点**识别并筛选**出来（UI 中标「住宅」，可 `only_residential: true` 只扇出住宅）。想要稳定的高质量住宅线路，建议把付费服务商的提取 URL 加进 `sources`（输出 `ip:port` 即可），检测和住宅判定逻辑完全通用。
 

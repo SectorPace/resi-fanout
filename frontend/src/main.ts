@@ -1,7 +1,7 @@
 import { api, fmtTs, fmtUptime, getKey, setKey, type Status } from "./api";
 import "./style.css";
 // el / badge / toast 也住在 views.ts 里（那边导出），依赖只剩 main → views 单向
-import { badge, el, renderProxies, renderPorts, renderConfig, renderXui, renderVpngate, renderWarp, toast } from "./views";
+import { badge, el, loadFanoutPorts, renderProxies, renderPorts, renderConfig, renderXui, renderVpngate, renderWarp, toast } from "./views";
 
 let statusTimer: number | undefined;
 
@@ -21,6 +21,16 @@ function nav(tab: string): void {
   if (tab === "status") {
     pollStatus();
     statusTimer = window.setInterval(pollStatus, 5000);
+  }
+  // 配置页和 3x-ui 页都只在启动时渲染过一次。配置页首次加载必然 401（浏览器
+  // 还没有 key），而用户是在页头那个框里填 key 的——不重新渲染的话，那个标签页
+  // 会一直停在「未授权」直到整页刷新，让唯一能编辑代理源的页面看起来是坏的。
+  // 3x-ui 页的端口勾选列表同理：之后新开放的端口不会自己出现。
+  if (tab === "config") {
+    void renderConfig(document.getElementById("view-config") as HTMLElement);
+  }
+  if (tab === "xui") {
+    void loadFanoutPorts();
   }
 }
 
@@ -104,6 +114,9 @@ function buildShell(): void {
               const input = document.getElementById("api-key") as HTMLInputElement;
               setKey(input.value.trim());
               toast("API Key 已保存");
+              // 用户多半正停在配置页等它生效（首次运行必然先 401），立刻重渲染一次。
+              const cfgView = document.getElementById("view-config");
+              if (cfgView && cfgView.style.display !== "none") void renderConfig(cfgView);
             }
           },
           "保存"

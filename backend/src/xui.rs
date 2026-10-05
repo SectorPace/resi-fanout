@@ -62,14 +62,26 @@ pub async fn entries_for(
         // guard must not be held across the loop. Only the two fields the
         // entry needs are copied, so this stays bounded by the assigned ports
         // instead of deep-cloning the pool.
+        // Built with an explicit first-wins insert rather than `.collect()`.
+        // `state.proxies` is a HashMap, so `values()` iterates in arbitrary
+        // (RandomState) order and `collect()` keeps the LAST entry for a
+        // duplicated port — whereas the linear `find()` this replaced kept the
+        // FIRST. The two can therefore pick different proxies for the same
+        // port, writing different country/residential values into the panel DB
+        // and changing between restarts. Neither assign path can produce a
+        // duplicate today (both track a `used` set), so this is latent — but a
+        // hand-edited or restored state.json makes it live.
         let by_port: HashMap<u16, (Option<String>, bool)> = {
             let map = state.proxies.read().await;
-            map.values()
-                .filter_map(|p| {
-                    p.local_port
-                        .map(|port| (port, (p.country_code.clone(), p.residential())))
-                })
-                .collect()
+            let mut by_port: HashMap<u16, (Option<String>, bool)> =
+                HashMap::with_capacity(map.len());
+            for p in map.values() {
+                let Some(port) = p.local_port else { continue };
+                by_port
+                    .entry(port)
+                    .or_insert_with(|| (p.country_code.clone(), p.residential()));
+            }
+            by_port
         };
 
         for port in ports {

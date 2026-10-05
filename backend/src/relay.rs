@@ -35,6 +35,22 @@ const RELAY_IDLE_CHECK: Duration = Duration::from_secs(15);
 /// byte (see `socks5_dial`), and a real name is at most 253 bytes anyway.
 const MAX_HOST_LEN: usize = 255;
 
+/// Concurrent sessions allowed per fanout listener.
+///
+/// `handle_local` can hold two sockets (client + upstream) for up to
+/// `RELAY_IDLE_TIMEOUT` — ten minutes. The handshake timeout only bounds the
+/// *pre-establishment* phase, so a client that completes the SOCKS5 handshake
+/// against a healthy port still pins 2 fds and 1 task for the whole idle window.
+/// With one unbounded task per accept(), enough concurrent sessions exhaust the
+/// process fd table, `accept()` then fails, `run_listener_inner` returns via
+/// `?`, and every fanout listener for every port starts dying and respawning on
+/// the supervisor's tick — i.e. one exposed port stalls the whole fanout.
+///
+/// Mirrors `tls::MAX_CONNECTIONS`, which bounds the admin listener for the same
+/// reason. Refuse (by dropping the socket) rather than queue: a queued client
+/// would hold its fd anyway.
+const MAX_SESSIONS: usize = 512;
+
 /// How to reach the internet for one fanout port:
 /// through an upstream proxy (free/paid lists) or out of a local
 /// OpenVPN tunnel interface (VPN Gate), bound to its source IP.
@@ -235,11 +251,21 @@ async fn run_listener_inner(
         let _ = tx.send(());
     }
     info!(%addr, dialer = ?dialer, "fanout port listening");
+    let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SESSIONS));
     loop {
         let (sock, peer) = listener.accept().await?;
         let st = state.clone();
         let dialer = dialer.clone();
+        let slots = slots.clone();
         tokio::spawn(async move {
+            let Ok(_permit) = slots.try_acquire_owned() else {
+                warn!(
+                    %peer,
+                    limit = MAX_SESSIONS,
+                    "refusing connection: fanout listener is at its session limit"
+                );
+                return; // drop closes the socket
+            };
             let mode = st.config().await.fanout.mode;
             if let Err(e) = handle_local(mode, sock, &dialer).await {
                 debug!(%peer, error = %e, "session ended");

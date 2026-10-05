@@ -176,6 +176,16 @@ done
 
 [ "$(id -u)" = "0" ] || die "please run as root: sudo bash $0"
 
+# --port 之前完全没有校验，而它随后会：作为 `|` 分隔 sed 替换式的替换文本（未转义
+# 的分隔符和 `&` 全匹配元字符都会出问题）、写进 config.json 的 server.listen、
+# 以及作为就绪探测 grep 的正则。`--port '80&81'` 会静默把监听地址改成一个
+# 运营商根本没要求的值，`--port 'a|b'` 则让 sed 报错并因 set -e 中途终止安装。
+case "${API_PORT}" in
+  ''|*[!0-9]*) die "--port must be a number, got: ${API_PORT}" ;;
+esac
+[ "${API_PORT}" -ge 1 ] && [ "${API_PORT}" -le 65535 ] \
+  || die "--port must be between 1 and 65535, got: ${API_PORT}"
+
 # When piped (curl ... | bash) BASH_SOURCE is "bash"; dirname then resolves
 # to the current directory, so the local-tree checks below simply miss and
 # the prebuilt-release / clone paths take over.
@@ -186,6 +196,29 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)" || SC
 # download (fast, no toolchain) > git clone + build (--from-source forces this)
 SRC_DIR=""
 PREBUILT="0"
+
+# --------------------------------------------------------------- system deps
+# Defined BEFORE the source-selection block below, because that block calls
+# install_pkgs to get git when no prebuilt release matches. Bash registers a
+# function name only when the definition command actually runs, so calling it
+# from a branch that executes earlier meant "install_pkgs: command not found"
+# followed by a misleading "git is required" — on the very path the author
+# wrote a git-install handler for. PKG likewise has to be resolved first,
+# because install_pkgs dispatches on it.
+PKG=""
+for m in apt-get dnf yum pacman; do
+  if command -v "$m" >/dev/null 2>&1; then PKG="$m"; break; fi
+done
+
+install_pkgs() {
+  case "$PKG" in
+    apt-get) DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+    dnf)     dnf install -y "$@" ;;
+    yum)     yum install -y "$@" ;;
+    pacman)  pacman -S --noconfirm --needed "$@" ;;
+    *)       warn "no known package manager; install manually: $*"; return 1 ;;
+  esac
+}
 
 if [ "${FROM_SOURCE}" != "1" ] && [ -n "${SCRIPT_DIR}" ] && [ -f "${SCRIPT_DIR}/backend/Cargo.toml" ] && [ -f "${SCRIPT_DIR}/frontend/package.json" ]; then
   SRC_DIR="${SCRIPT_DIR}"
@@ -212,7 +245,11 @@ except Exception:
     sys.exit(0)
 if isinstance(rels, list) and rels:
     print(rels[0].get("tag_name", ""))
-' 2>/dev/null)"
+' 2>/dev/null)" || LATEST_TAG=""
+  # `|| LATEST_TAG=""` 是必需的，不是防御性冗余：pipefail 让管道的状态取最右侧
+  # 非零退出，curl 拿到 403/22 时整个赋值语句会触发 errexit 直接终止安装，
+  # 下面的 releases/latest 回退分支永远走不到。而未认证的 api.github.com
+  # 限流只有 60 次/时/IP，本项目又正是 `curl … | sudo bash` 的安装方式。
   if [ -n "${LATEST_TAG}" ]; then
     REL_URL="https://github.com/${GH_REPO}/releases/download/${LATEST_TAG}"
     log "latest release: ${LATEST_TAG}"
@@ -260,7 +297,11 @@ else
   if [ -f "${SCRIPT_DIR}/backend/Cargo.toml" ]; then
     SRC_DIR="${SCRIPT_DIR}"
   else
-    TMP="$(mktemp -d)"
+    # Must live under TMPROOT: a bare `mktemp -d` lands outside it, so the
+    # `trap cleanup EXIT` at the top (and uninstall.sh's "the installer traps"
+    # comment) never removes it, leaving a full clone — potentially with
+    # private keys under data/ — in /tmp indefinitely.
+    TMP="${TMPROOT}/clone"; mkdir -p "$TMP"
     git clone --depth 1 "${REPO_URL}" "${TMP}/src" >&2
     SRC_DIR="${TMP}/src"
   fi
@@ -268,21 +309,6 @@ else
 fi
 
 # ---------------------------------------------------------------- system deps
-PKG=""
-for m in apt-get dnf yum pacman; do
-  if command -v "$m" >/dev/null 2>&1; then PKG="$m"; break; fi
-done
-
-install_pkgs() {
-  case "$PKG" in
-    apt-get) DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
-    dnf)     dnf install -y "$@" ;;
-    yum)     yum install -y "$@" ;;
-    pacman)  pacman -S --noconfirm --needed "$@" ;;
-    *)       warn "no known package manager; install manually: $*"; return 1 ;;
-  esac
-}
-
 log "installing base packages (curl git ca-certificates python3 openvpn)"
 { apt-get update -y >/dev/null 2>&1 || true; } 2>/dev/null || true
 install_pkgs curl git ca-certificates python3 openvpn iproute2 \
@@ -356,11 +382,17 @@ try_issue_cert() {
       aarch64|arm64) LEGO_URL="https://github.com/go-acme/lego/releases/download/v5.5.2/lego_v5.5.2_linux_arm64.tar.gz" ;;
       *) warn "该架构没有 lego 预编译包"; return 1 ;;
     esac
-    # the tarball holds lego/ inside; extract, then install just the binary
+    # the tarball holds lego/ inside; extract, then install just the binary.
+    # dest MUST be the real system path: fetch_verify ends in
+    # `install -m 755 <src> <dest>`, so pointing dest at the extraction dir
+    # would drop the binary inside ${TMPROOT}, which PATH does not cover and
+    # which `trap cleanup EXIT` then deletes -- leaving line 379 invoking a bare
+    # `lego` (command not found) while the log claimed success, and silently
+    # degrading every install to plain HTTP.
     T="${TMPROOT}/lego"; mkdir -p "$T"
-    LEGO_BIN="${T}/lego"
+    LEGO_BIN="/usr/local/bin/lego"
     if fetch_verify "${LEGO_URL}" "${LEGO_BIN}" "lego" tar "${LEGO_SHA256:-}"; then
-      green "lego 已安装：/usr/local/bin/lego"
+      green "lego 已安装：${LEGO_BIN}"
     else
       warn "lego 下载/校验失败（404/网络）。手动安装：
       curl -fsSL ${LEGO_URL} | tar xz -C /usr/local/bin && chmod +x /usr/local/bin/lego"
@@ -654,14 +686,32 @@ api() {
   python3 - "$CONF" "${1:-/api/status}" <<'PY'
 import json, sys, ssl, urllib.request
 cfg = json.load(open(sys.argv[1]))
-host, _, port = cfg["server"]["listen"].rpartition(":")
+listen, _, port = cfg["server"]["listen"].rpartition(":")
 key = cfg["server"]["api_key"]
 scheme = "https" if cfg["server"].get("tls", {}).get("enabled") else "http"
+# 证书是 lego 为公网 IP 签的（唯一 SAN 是 iPAddress:<公网IP>，见 try_issue_cert 的
+# --domains "${PUBLIC_IP}"），而这里连的是本机回环。Python 默认上下文做完整身份
+# 校验，于是每次都 CERTIFICATE_VERIFY_FAILED: IP address mismatch —— rf version
+# 只能打印 unknown，status_panel 更糟：它 2>/dev/null 丢掉 stderr、下游 python
+# 又是裸 except，于是菜单永远显示「运行中」而代理统计恒为 0。
+# 回环上没有中间人，TLS 在这里只是防本机旁听，所以关掉身份匹配、但保留证书链
+# 校验（verify_mode 仍是 CERT_REQUIRED）。
+# 0.0.0.0 / :: 不是可连接地址，回落到 127.0.0.1。
+host = listen if listen not in ("", "0.0.0.0", "::", "[::]") else "127.0.0.1"
+ctx = None
+if scheme == "https":
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
 req = urllib.request.Request(
-    f"{scheme}://127.0.0.1:{port}{sys.argv[2]}",
+    f"{scheme}://{host}:{port}{sys.argv[2]}",
     headers={"Authorization": f"Bearer {key}"} if key else {})
-ctx = ssl.create_default_context() if scheme == "https" else None
-print(urllib.request.urlopen(req, timeout=15, context=ctx).read().decode())
+try:
+    print(urllib.request.urlopen(req, timeout=15, context=ctx).read().decode())
+except Exception as e:
+    # 不要把 traceback 喷到 stderr 就完事：调用方（尤其是 status_panel）会
+    # 2>/dev/null 吞掉它，从而把失败伪装成成功。走 stdout + 非零退出码。
+    print(json.dumps({"error": str(e)}))
+    sys.exit(1)
 PY
 }
 
@@ -946,7 +996,7 @@ cat <<EOF
 
 ============================================================
  ${APP} installed
-  API/UI : ${TLS_ENABLED:-http://}${PUBLIC_IP:-127.0.0.1}:${API_PORT}${BASE_PATH:-}  (web root: ${PREFIX}/web)
+  API/UI : ${TLS_ENABLED:-http://}${PUBLIC_IP:-127.0.0.1}:${LISTEN_PORT}${BASE_PATH:-}  (web root: ${PREFIX}/web)
   API key: 见 `rf key`（不再明文打印，避免进入日志/CI 记录）
   config : ${CONF_DIR}/config.json
   data   : ${DATA_DIR}
@@ -956,12 +1006,12 @@ cat <<EOF
  自动启动: 已设置开机自启（systemctl enable ${SERVICE}），rf restart 可手动重启
 
  next steps:
-  1. 公网访问需在云安全组/防火墙放行 ${API_PORT} 端口（仅本机则用 ssh -L ${API_PORT}:127.0.0.1:${API_PORT}）
+  1. 公网访问需在云安全组/防火墙放行 ${LISTEN_PORT} 端口（仅本机则用 ssh -L ${LISTEN_PORT}:127.0.0.1:${LISTEN_PORT}）
      注：扇出的代理端口（20000+）只监听 127.0.0.1，不需要对公网开放；数量可在「配置」页调整
   2. wait for the first fetch+check cycle (~1-3 min), check 总览
   3. integrate with 3x-ui:
      bash ${PREFIX}/scripts/3xui-push.sh \\
-        --api http://127.0.0.1:${API_PORT} --key <API_KEY>
+        --api http://127.0.0.1:${LISTEN_PORT} --key <API_KEY>
      or use the UI tab 接入 3x-ui → generate outbounds and paste them
      into the panel's Xray config.
 ============================================================

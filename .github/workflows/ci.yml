@@ -41,7 +41,7 @@ jobs:
         run: cargo test --locked
       - name: Build release
         working-directory: backend
-        run: cargo build --release
+        run: cargo build --release --locked
 
   version-sync:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -63,7 +63,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
+      # fetch-depth: 0 so the staleness gate below can ask whether the commit
+      # that last touched frontend/src is an ancestor of the one that last
+      # touched frontend/dist. A shallow clone cannot answer that.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
@@ -75,6 +80,28 @@ jobs:
       - name: Typecheck + build
         working-directory: frontend
         run: npm run build
+      # install.sh falls back to the *committed* frontend/dist when npm is
+      # unavailable (--no-frontend, or a failed toolchain install), so a stale
+      # dist silently serves an old console to those installs instead of
+      # failing loudly. This caught up when dist was last rebuilt two source
+      # revisions behind. Deliberately compares commit topology rather than
+      # diffing a fresh build against dist: vite's output is not guaranteed
+      # byte-identical across Node versions, and a false failure here would
+      # train everyone to ignore it.
+      - name: Committed dist is not stale
+        run: |
+          src="$(git log -1 --format=%H -- frontend/src)"
+          dst="$(git log -1 --format=%H -- frontend/dist)"
+          if [ -z "$dst" ]; then
+            echo "::error::frontend/dist is not committed at all"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$src" "$dst"; then
+            echo "::error::frontend/dist is stale: $(git log -1 --format='%h %s' -- frontend/src) touched frontend/src after $(git log -1 --format='%h %s' -- frontend/dist) last rebuilt frontend/dist"
+            echo "Run 'npm ci && npm run build' in frontend/ and commit the result."
+            exit 1
+          fi
+          echo "dist is current with src ($(git log -1 --format=%h -- frontend/src))"
 
   shell:
     runs-on: ubuntu-latest
@@ -89,3 +116,8 @@ jobs:
       - name: Shellcheck
         run: |
           shellcheck -S warning install.sh uninstall.sh scripts/*.sh
+      # scripts/xui_db.py writes directly to the 3x-ui panel SQLite database and
+      # is invoked by the Rust backend, so a syntax error in it would break the
+      # integration at runtime with nothing having caught it in CI.
+      - name: Python syntax
+        run: python3 -m py_compile scripts/xui_db.py

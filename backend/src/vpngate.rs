@@ -418,7 +418,13 @@ pub fn rank(pool: &[VpnServer], countries: &[String], min_speed_mbps: u64) -> Ve
                     return false;
                 }
             }
-            s.speed_bps == 0 || s.speed_bps >= min_speed_mbps * 1_000_000
+            // saturating_mul: `min_speed_mbps` is a plain u64 straight from config/JSON and
+            // is not clamped (unlike cache_days), so a large value used to wrap in
+            // release builds -- silently admitting garbage-speed relays -- and
+            // panic in debug/test. `rank` runs inside openvpn::reconcile in the
+            // supervisor's tokio::spawn, and a panic there kills the only task
+            // owning `running`, with nothing to restart it.
+            s.speed_bps == 0 || s.speed_bps >= min_speed_mbps.saturating_mul(1_000_000)
         })
         .cloned()
         .collect();

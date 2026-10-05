@@ -95,10 +95,19 @@ impl Default for FanoutCfg {
 #[serde(default)]
 pub struct CheckerCfg {
     pub timeout_secs: u64,
-    /// In-flight classifier requests. Keep this at or below what
-    /// `classify_url` allows per minute: the default ip-api.com endpoint
-    /// throttles at ~45 req/min per IP, and a throttled response is NOT
-    /// treated as a dead proxy, but it still means the round learns nothing.
+    /// In-flight classifier requests.
+    ///
+    /// This bounds only how many checks are *outstanding at once*, not how
+    /// fast a round completes: the classifier endpoint's own per-minute quota
+    /// is the binding limit for proxies that actually reach it (~45 req/min for
+    /// the default ip-api.com endpoint), and a 429 is deliberately treated as
+    /// "learned nothing" rather than "proxy is dead", so overshooting is safe.
+    /// Raising it is still worth it, because proxies that *time out* never
+    /// reach the endpoint and consume no quota — at 8 s each, a pool of 4000
+    /// dead entries drains in ~2 min at 256 versus ~17 min at 32.
+    ///
+    /// To actually classify a large pool faster, point `classify_url` at an
+    /// endpoint with a higher quota.
     pub concurrency: usize,
     /// Upper bound on stored candidates (memory bound); worst entries evicted.
     pub max_pool: usize,
@@ -286,10 +295,19 @@ pub struct WarpCfg {
     pub keepalive: u64,
     pub mtu: u64,
     /// Mihomo sidecar (used for MASQUE nodes Clash-style, which are not
-    /// plain WireGuard). Its mixed-port becomes another fanout port.
+    /// plain WireGuard). It listens on `mihomo_port`.
     pub mihomo_bin: String,
     pub mihomo_port: u16,
     pub mihomo_conf: String,
+    /// The fanout port clients actually connect to for a MASQUE tunnel.
+    ///
+    /// This MUST differ from `mihomo_port`. The sidecar is the *upstream* and
+    /// already binds `mihomo_port` on loopback (`mixed-port`, allow-lan false),
+    /// so reusing it for our own listener made the two fight over one port:
+    /// whichever lost got EADDRINUSE, and if ours won its dialer pointed at
+    /// itself, so every client CONNECT re-entered the listener and dialed the
+    /// same port again until fds ran out.
+    pub masque_port: u16,
 }
 
 impl Default for WarpCfg {
@@ -306,6 +324,7 @@ impl Default for WarpCfg {
             mihomo_bin: "mihomo".into(),
             mihomo_port: 22100,
             mihomo_conf: "/var/lib/resi-fanout/masque/mihomo.yaml".into(),
+            masque_port: 22200,
         }
     }
 }
@@ -380,10 +399,88 @@ impl Config {
     /// brought the whole `/api` surface up unauthenticated, on the default
     /// port, with a `web_root` that does not resolve — and then tried to
     /// overwrite the operator's config with those defaults.
-    pub fn load(path: &str) -> anyhow::Result<Config> {
+    /// Invariants that must hold for a config to be usable, checked identically
+/// whether it arrived through `PUT /api/config` or was read off disk.
+///
+/// This used to live only inside `put_config`, which meant a hand-edited (or
+/// truncated-at-a-field-boundary) config.json deserialised cleanly through
+/// `#[serde(default)]` and bypassed every guard — e.g.
+/// `{"fanout": {"max_ports": 99999999}}` started the service, and
+/// `next_free_port` then cast out-of-range candidates to `u16`.
+pub fn validate(&self) -> Result<(), String> {
+    // u64 arithmetic on purpose: release builds have overflow checks off, so
+    // `base_port as u32 + max_ports` wraps around and lets absurd values like
+    // base_port=65535 + max_ports=u32::MAX pass.
+    let port_end = u64::from(self.fanout.base_port) + u64::from(self.fanout.max_ports);
+    if self.fanout.max_ports == 0 || port_end > 65536 {
+        return Err(format!(
+            "bad fanout port range: base_port {} + max_ports {} is not a usable block",
+            self.fanout.base_port, self.fanout.max_ports
+        ));
+    }
+    // An invalid base_path panics while registering routes on the next start, so
+    // it has to be rejected before it is ever stored.
+    let base = crate::api::normalize_base(&self.server.base_path);
+    if !base.is_empty()
+        && !base
+            .trim_start_matches('/')
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err("base_path may only contain letters, digits, - and _".into());
+    }
+    // The WireGuard profile is interpolated into a PostUp line wg-quick hands to
+    // `sh -c`, so an unusable interface name must never reach managed_conf.
+    if self.warp.enabled && !crate::warp::valid_iface(&self.warp.interface) {
+        return Err(format!(
+            "warp.interface {:?} is not a valid interface name (allowed: A-Za-z0-9_.- , max 15 chars)",
+            self.warp.interface
+        ));
+    }
+    if self.warp.enabled && self.warp.masque_port == self.warp.mihomo_port {
+        return Err(format!(
+            "warp.masque_port and warp.mihomo_port are both {} — the fanout listener and the \
+             mihomo sidecar must not share one port",
+            self.warp.mihomo_port
+        ));
+    }
+    Ok(())
+}
+
+pub fn load(path: &str) -> anyhow::Result<Config> {
         match std::fs::read_to_string(path) {
-            Ok(s) => serde_json::from_str(&s).with_context(|| format!("parse config {path}")),
+            Ok(s) => {
+                let c: Config = serde_json::from_str(&s)
+                    .with_context(|| format!("parse config {path}"))?;
+                // Serde alone cannot catch a structurally-wrong-but-valid file:
+                // `#[serde(default)]` fills every absent field, so a truncated or
+                // hand-edited config happily produces a working Config with an
+                // absurd port range. Validate before it can reach the listeners.
+                if let Err(why) = c.validate() {
+                    anyhow::bail!(
+                        "config {path} is invalid: {why}\n\
+                         refusing to start with it. Fix the file, or delete it to regenerate \
+                         defaults (which have an empty api_key — set one before exposing the port)."
+                    );
+                }
+                Ok(c)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // `read_to_string` reports NotFound for a *dangling symlink* too,
+                // and then we would write a default config — with an empty
+                // api_key — over the operator's chosen path, which is exactly the
+                // fail-open this function exists to prevent. Only treat the file
+                // as genuinely absent when nothing is there at all.
+                if let Ok(md) = std::fs::symlink_metadata(path) {
+                    if md.file_type().is_symlink() {
+                        anyhow::bail!(
+                            "config {path} is a dangling symlink (its target does not exist).\n\
+                             refusing to write a default config over it: that default has an empty \
+                             api_key, so every /api route would end up unauthenticated. Create the \
+                             target file or point --config somewhere real."
+                        );
+                    }
+                }
                 let c = Config::default();
                 if let Err(write_err) = c.save_to(path) {
                     tracing::warn!(path, error = %write_err, "could not write default config");
@@ -431,5 +528,116 @@ impl Config {
             return Err(e.into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// First writable directory among a few candidates.
+    ///
+    /// `std::env::temp_dir()` is not reliably writable — WSL images in
+    /// particular often mount `/tmp` read-only, which would make every test here
+    /// fail for a reason that has nothing to do with the code under test.
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let name = format!(
+            "rf-cfg-{tag}-{}-{}",
+            std::process::id(),
+            crate::models::now_ts()
+        );
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        for var in ["CARGO_TARGET_TMPDIR", "CARGO_TARGET_DIR"] {
+            if let Ok(p) = std::env::var(var) {
+                if !p.is_empty() {
+                    roots.push(std::path::PathBuf::from(p));
+                }
+            }
+        }
+        roots.push(std::env::temp_dir());
+        for root in &roots {
+            let d = root.join(&name);
+            if std::fs::create_dir_all(&d).is_ok() {
+                return d;
+            }
+        }
+        panic!("no writable temp dir among {roots:?}");
+    }
+
+    #[test]
+    fn accepts_the_shipped_defaults() {
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_the_invariants_the_api_also_rejects() {
+        // Absurd max_ports used to deserialise cleanly through
+        // `#[serde(default)]` and only be caught on the PUT path.
+        let mut c = Config::default();
+        c.fanout.max_ports = 99_999_999;
+        assert!(c.validate().is_err(), "absurd max_ports accepted");
+
+        // base_port + max_ports wrapping past the u16 space
+        let mut c = Config::default();
+        c.fanout.base_port = 65535;
+        c.fanout.max_ports = 40000;
+        assert!(c.validate().is_err(), "overflowing port range accepted");
+
+        let mut c = Config::default();
+        c.fanout.max_ports = 0;
+        assert!(c.validate().is_err(), "max_ports=0 accepted");
+
+        // a base_path that panics Router::route on the next start
+        let mut c = Config::default();
+        c.server.base_path = "/bad*path".into();
+        assert!(c.validate().is_err(), "invalid base_path accepted");
+
+        // the masque fanout listener and the mihomo sidecar must not share a port
+        let mut c = Config::default();
+        c.warp.enabled = true;
+        c.warp.masque_port = c.warp.mihomo_port;
+        assert!(c.validate().is_err(), "shared masque/mihomo port accepted");
+
+        let mut c = Config::default();
+        c.warp.enabled = true;
+        c.warp.interface = "rf; id".into();
+        assert!(c.validate().is_err(), "shell-unsafe interface accepted");
+    }
+
+    #[test]
+    fn load_rejects_a_structurally_wrong_but_parseable_config() {
+        let d = tmpdir("wrong");
+        let p = d.join("config.json");
+        // valid JSON, but max_ports is nonsense; `#[serde(default)]` used to
+        // let this start the service.
+        std::fs::write(&p, r#"{"fanout": {"max_ports": 99999999}}"#).unwrap();
+        let err = Config::load(p.to_str().unwrap()).unwrap_err().to_string();
+        assert!(err.contains("invalid"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn load_refuses_to_overwrite_a_dangling_symlink() {
+        let d = tmpdir("dangling");
+        let target = d.join("not-created-yet.json");
+        let link = d.join("config.json");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let res = Config::load(link.to_str().unwrap());
+        assert!(res.is_err(), "wrote a default config over a dangling symlink");
+        // and, critically, no config was created at either path
+        assert!(!target.exists(), "default config was written to the link target");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn load_still_bootstraps_when_the_file_is_genuinely_absent() {
+        let d = tmpdir("absent");
+        let p = d.join("config.json");
+        let c = Config::load(p.to_str().unwrap()).expect("absent config must fall back");
+        assert_eq!(c.fanout.max_ports, 20);
+        assert!(p.exists(), "default config should have been written");
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

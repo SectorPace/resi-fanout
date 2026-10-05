@@ -186,6 +186,29 @@ pub async fn serve(state: Arc<AppState>) -> anyhow::Result<()> {
 
 // ------------------------------------------------------------------- auth
 
+/// Length-independent, content-constant-time byte-slice equality.
+///
+/// `a == b` on `&[u8]`/`&str` delegates to `memcmp`, which returns at the first
+/// differing byte — so the comparison takes longer the more leading bytes an
+/// attacker guesses correctly. That is the textbook timing side channel, and
+/// this is the only credential gate in front of the entire admin surface
+/// (`PUT /api/config` can rewrite `api_key`, `listen` and `tls.enabled`;
+/// ports/warp/3x-ui routes all mutate host state) on a service explicitly meant
+/// to be reachable on 0.0.0.0.
+///
+/// Accumulating XOR over the full length plus folding in the length difference
+/// avoids both the early exit and a separate length check. `black_box` keeps the
+/// optimiser from rewriting the loop back into an early-exit memcmp.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
+}
+
 async fn auth(
     State(state): State<Arc<AppState>>,
     req: Request<axum::body::Body>,
@@ -193,11 +216,12 @@ async fn auth(
 ) -> Response {
     let key = state.config().await.server.api_key;
     if !key.is_empty() {
+        let expect = format!("Bearer {key}");
         let ok = req
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .map(|v| v == format!("Bearer {key}"))
+            .map(|v| ct_eq(v.as_bytes(), expect.as_bytes()))
             .unwrap_or(false);
         if !ok {
             return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -694,27 +718,10 @@ async fn put_config(
     State(state): State<Arc<AppState>>,
     Json(cfg): Json<crate::config::Config>,
 ) -> Response {
-    // u64 arithmetic on purpose: release builds have overflow checks off, so
-    // `base_port as u32 + max_ports` wraps around and let absurd values like
-    // base_port=65535 + max_ports=u32::MAX pass this guard.
-    let port_end = u64::from(cfg.fanout.base_port) + u64::from(cfg.fanout.max_ports);
-    if cfg.fanout.max_ports == 0 || port_end > 65536 {
-        return (StatusCode::BAD_REQUEST, "bad fanout port range").into_response();
-    }
-    // an invalid base_path would panic while registering routes on the next
-    // start, so reject it at write time
-    let base = normalize_base(&cfg.server.base_path);
-    if !base.is_empty()
-        && !base
-            .trim_start_matches('/')
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            "base_path may only contain letters, digits, - and _",
-        )
-            .into_response();
+    // Same validation the on-disk load path runs, so a value rejected here can
+    // never arrive by hand-editing config.json instead.
+    if let Err(why) = cfg.validate() {
+        return (StatusCode::BAD_REQUEST, why).into_response();
     }
     // Only probe when the address actually changes. The live listener already owns
     // the current address, so re-binding it would always fail and emit a
@@ -779,8 +786,12 @@ async fn ports_assign(State(state): State<Arc<AppState>>, body: Option<Json<Valu
     let mut assigned = Vec::new();
     {
         let mut map = state.proxies.write().await;
-        // 已占用的端口
-        let mut used: Vec<u16> = map.values().filter_map(|p| p.local_port).collect();
+        // 已占用的端口。用 HashSet：UI 会把节点池里勾选的每一行都发过来，
+        // max_pool 默认 4000，Vec::contains 是线性扫描，于是这里会退化成
+        // O(keys x max_ports x 已占用数)——最坏约 10^9 次比较，而且全程持有
+        // state.proxies 的写守卫。state.rs::assign_ports 已经用的是 HashSet。
+        let mut used: std::collections::HashSet<u16> =
+            map.values().filter_map(|p| p.local_port).collect();
         let mut keys = keys.clone();
         keys.sort_by_key(|k| {
             map.get(k).and_then(|p| p.latency_ms).unwrap_or(u64::MAX)
@@ -808,17 +819,31 @@ async fn ports_assign(State(state): State<Arc<AppState>>, body: Option<Json<Valu
                 }
             }
             let Some(p2) = port else { break };
-            used.push(p2);
+            used.insert(p2);
             map.get_mut(&k).map(|p| p.local_port = Some(p2));
             assigned.push(json!({"key": k, "port": p2}));
         }
     }
-    // 关掉自动分配，避免下一轮把手动结果覆盖
-    {
+    // 关掉自动分配，避免下一轮把手动结果覆盖。
+    //
+    // 必须先释放写锁、再调用 save_config()：后者的第一句就是
+    // `self.cfg.read().await`，而 tokio 的 RwLock 是公平且写优先的——已经持有
+    // 写守卫的任务再排队申请读锁会**永久**死锁。这不是挂起一个请求，而是把整个
+    // 服务卡死：/api/status、/api/proxies、调度循环、中继监管、检测器全都阻塞在
+    // state.config() 上。而且 auto_assign 默认就是 true，所以默认配置下点一次
+    // 「开放端口」就会触发。
+    let flipped = {
         let mut c = state.cfg.write().await;
         if c.fanout.auto_assign {
             c.fanout.auto_assign = false;
-            let _ = state.save_config().await;
+            true
+        } else {
+            false
+        }
+    };
+    if flipped {
+        if let Err(e) = state.save_config().await {
+            tracing::warn!(error = %e, "could not persist auto_assign=false");
         }
     }
     state.dirty.store(true, Ordering::Relaxed);

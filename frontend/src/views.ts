@@ -76,6 +76,29 @@ function linkScheme(protocol: string): string {
 }
 
 /**
+ * 复制到剪贴板，返回是否成功，调用方据此决定要不要弹「已复制」。
+ *
+ * 直接 `navigator.clipboard.writeText(...)` 有两个坑，这里一并兜住：
+ *   1. Clipboard API 只在 SecureContext 下存在。明文 HTTP 部署是受支持的
+ *      配置（install.sh --no-tls / 未签证书），此时 navigator.clipboard 是
+ *      undefined，直接调用会抛 TypeError，连错误 toast 都出不来。
+ *   2. 即使在 HTTPS 下，文档失焦或权限被拒也会返回 rejected promise；
+ *      原来用 `void` 丢弃它，于是界面照样提示「已复制」，实际什么都没复制。
+ */
+async function copyText(text: string): Promise<boolean> {
+  const cb = navigator.clipboard;
+  if (!cb) return false;
+  try {
+    await cb.writeText(text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const CLIPBOARD_HINT = "复制失败：明文 HTTP 下浏览器禁用剪贴板 API，请手动选中复制";
+
+/**
  * 3x-ui 联动的行（plan / created）里，本地端口优先取 fanout_port，
  * 老脚本可能只给 port；都没有就留空——绝不能退化去显示 inbound_tag，
  * 那是面板入站 tag，不是本地端口。
@@ -301,11 +324,19 @@ export function renderPorts(root: HTMLElement): void {
           try {
             const { items } = await api.ports();
             const lines = items.map((p) => `${linkScheme(p.protocol)}://127.0.0.1:${p.port}#${p.country_code || p.protocol}-${p.port}`);
-            await navigator.clipboard.writeText(lines.join("\n"));
-            toast(`已复制 ${lines.length} 条 socks 链接`);
+            // 端口协议由 fanout.mode 决定（socks / http / mixed），所以按钮文案
+            // 不能写死「socks」——http 模式下复制出去的是 http:// 链接，
+            // 照着提示去配 SOCKS 客户端会直接连不上。
+            const schemes = [...new Set(items.map((p) => linkScheme(p.protocol)))];
+            const kind = schemes.length === 1 ? schemes[0] : "代理";
+            if (await copyText(lines.join("\n"))) {
+              toast(`已复制 ${lines.length} 条 ${kind} 链接`);
+            } else {
+              toast(CLIPBOARD_HINT, false);
+            }
           } catch (e) { toast(String(e), false); }
         }
-      }, "复制全部 socks 链接"),
+      }, "复制全部代理链接"),
       el("button", { onclick: () => void reload() }, "刷新列表")
     ),
     el("div", { id: "port-table" })
@@ -533,8 +564,7 @@ export function renderWarp(root: HTMLElement): void {
           onclick: () => {
             const ta = document.getElementById("warp-out") as HTMLTextAreaElement | null;
             if (!ta || !ta.value) { toast("还没有 WARP 配置", false); return; }
-            void navigator.clipboard.writeText(ta.value);
-            toast("已复制 Xray 出站");
+            void copyText(ta.value).then((ok) => toast(ok ? "已复制 Xray 出站" : CLIPBOARD_HINT, ok));
           }
         }, "复制 Xray 出站")
       ),
@@ -718,21 +748,35 @@ export function renderWarp(root: HTMLElement): void {
   startPolling(() => void loadWarp(), 15000);
 }
 
+/**
+ * 配置页的渲染序号。现在 nav() 每次切到本页都会重新渲染（否则首次运行那个
+ * 必然的 401 会一直挂在页面上），于是连续快速切页会产生多个并发的
+ * api.config() 请求。先发后到的失败响应会把后来成功取到的表单覆盖成错误提示，
+ * 所以只有序号最新的那次渲染才允许写 DOM。
+ */
+let cfgSeq = 0;
+
 export async function renderConfig(root: HTMLElement): Promise<void> {
+  const seq = ++cfgSeq;
   let cfg: Config;
   try {
     cfg = await api.config();
   } catch (e) {
+    if (seq !== cfgSeq) return;
     root.replaceChildren(el("div", { class: "error" }, String(e)));
     return;
   }
+  if (seq !== cfgSeq) return;
 
-  const f = (label: string, id: string, value: string | number, hint = ""): HTMLElement =>
+  // type 默认 text；密钥类字段必须显式传 "password"，否则管理密钥会以明文
+// 渲染在配置页上（可被 select-all / 截图 / 肩窥拿走）。页头那个输入框
+// （main.ts #api-key）本来就是 password，这里之前和它不一致。
+const f = (label: string, id: string, value: string | number, hint = "", type = "text"): HTMLElement =>
     el(
       "div",
       { class: "field" },
       el("label", { for: id }, label),
-      el("input", { id, value: String(value) }),
+      el("input", { id, type, value: String(value) }),
       hint ? el("small", { class: "dim" }, hint) : el("span")
     );
 
@@ -743,7 +787,18 @@ export async function renderConfig(root: HTMLElement): Promise<void> {
   };
 
   const get = (id: string): string => (document.getElementById(id) as HTMLInputElement).value.trim();
-  const getn = (id: string): number => Number(get(id));
+  // Number("") 是 0 而不是 NaN，所以清空一个数字框会把 0 原样存下去：
+  // base_port: 0 会让 relay 绑到随机临时端口，所有客户端链接全断且界面零报错；
+  // 非数字则是 NaN，JSON.stringify 变成 null，后端整份配置 422，用户丢掉
+  // 表单里其它所有修改。这里拦下来给出可读提示。
+  const getn = (id: string): number => {
+    const raw = get(id);
+    const n = Number(raw);
+    if (raw === "" || !Number.isFinite(n) || !Number.isInteger(n) || n < 0) {
+      throw new Error(`「${raw === "" ? "空" : raw}」不是合法的非负整数（字段 ${id}）`);
+    }
+    return n;
+  };
 
   root.replaceChildren(
     el(
@@ -754,7 +809,7 @@ export async function renderConfig(root: HTMLElement): Promise<void> {
         {},
         el("legend", {}, "服务"),
         f("监听地址 (API/UI)", "c-listen", cfg.server.listen),
-        f("API Key（留空=不鉴权）", "c-apikey", cfg.server.api_key),
+        f("API Key（留空=不鉴权）", "c-apikey", cfg.server.api_key, "", "password"),
         f("前端目录", "c-web", cfg.server.web_root)
       ),
       el(
@@ -854,6 +909,10 @@ export async function renderConfig(root: HTMLElement): Promise<void> {
                   // source row that can never fetch anything, while `[1,2,3]`
                   // only fails later as a raw HTTP 422 from axum's extractor.
                   const KIND = ["text", "monosans", "geonode"];
+                  // Protocol 是封闭枚举且没有 #[serde(other)]，拼错会直接让 axum 的
+                  // Json<Config> 提取器返回 422，整份配置保存失败、这一表单上其余
+                  // 修改全部丢失。所以这里必须和白名单比对，而不只是判断是不是字符串。
+                  const PROTOCOL = ["http", "socks4", "socks5"];
                   const bad = (why: string): Error => new Error(`代理源格式有误：${why}`);
                   if (!Array.isArray(parsed)) throw bad("顶层必须是数组");
                   const rows = parsed as unknown[];
@@ -870,16 +929,32 @@ export async function renderConfig(root: HTMLElement): Promise<void> {
                     if (o.kind !== undefined && (typeof o.kind !== "string" || !KIND.includes(o.kind))) {
                       throw bad(`${at} 的 kind 只能是 ${KIND.join(" / ")}`);
                     }
-                    if (o.protocol !== undefined && o.protocol !== null && typeof o.protocol !== "string") {
-                      throw bad(`${at} 的 protocol 必须是字符串或 null`);
+                    if (o.protocol !== undefined && o.protocol !== null) {
+                    if (typeof o.protocol !== "string" || !PROTOCOL.includes(o.protocol)) {
+                      throw bad(`${at} 的 protocol 只能是 null / ${PROTOCOL.join(" / ")}`);
                     }
+                  }
                     if (o.enabled !== undefined && typeof o.enabled !== "boolean") {
                       throw bad(`${at} 的 enabled 必须是布尔值`);
                     }
                   });
                   sources = rows as Config["sources"];
                 }
-                // 基于服务端当前配置做增量覆盖：只改表单里出现的字段，
+                // 清空 API Key 会让整个 /api 失去鉴权（代理、配置、端口、3x-ui 联动全部裸奔），
+// 而控制台照样能用——key 还在发，只是不再被校验，所以很容易被误操作触发而毫无察觉。
+// 这里要求显式确认。
+const newKey = get("c-apikey");
+if (cfg.server.api_key && !newKey) {
+  const ok = window.confirm(
+    "确定要清空 API Key 吗？\n\n" +
+      "保存后所有 /api 接口将不再校验鉴权，任何能访问到该端口的人都可以读写配置、" +
+      "增删端口、联动 3x-ui。\n\n" +
+      "只有在本机 loopback 监听、或前置反向代理已经做鉴权时才应该这样做。"
+  );
+  if (!ok) return;
+}
+
+// 基于服务端当前配置做增量覆盖：只改表单里出现的字段，
                 // 绝不能丢掉 base_path / tls / warp / xui 等未暴露的段
                 // （丢掉会把公网 HTTPS + 随机路径降级成明文 HTTP）
                 const next: Config = {
@@ -888,7 +963,7 @@ export async function renderConfig(root: HTMLElement): Promise<void> {
                   server: {
                     ...cfg.server,
                     listen: get("c-listen"),
-                    api_key: get("c-apikey"),
+                    api_key: newKey,
                     web_root: get("c-web")
                   },
                   fanout: {
@@ -1108,8 +1183,9 @@ export function renderXui(root: HTMLElement): void {
           ? el("button", { onclick: () => void doLink(false) }, "确认写入面板")
           : el("button", {
               onclick: () => {
-                void navigator.clipboard.writeText(rows.map((x) => x.link || "").join("\n"));
-                toast("已复制链接");
+                void copyText(rows.map((x) => x.link || "").join("\n")).then((ok) =>
+                  toast(ok ? "已复制链接" : CLIPBOARD_HINT, ok)
+                );
               }
             }, "复制全部链接")
       );
@@ -1132,10 +1208,18 @@ export function renderXui(root: HTMLElement): void {
     params.set("mode", mode);
     if (mode === "balancer") {
       params.set("residential", residentialOnly ? "1" : "0");
-      if (residentialOnly) params.set("residential", "1");
       if (inbound) params.set("inbound", inbound);
     } else {
-      const checked = checkedPorts();
+      // 直连模式下后端只看 ports 参数（api.rs: 有 ports 就不看 residential），
+      // 所以「仅住宅」必须在前端把勾选集过滤掉，否则这个按钮发出的请求和
+      // 「生成」完全一样，是个假开关。
+      const checked = checkedPorts(residentialOnly);
+      if (residentialOnly && !checked.length) {
+        // 注意不能让它就这么把 ports 省略掉：那等于回退到「全部端口」，
+        // 和用户要的恰好相反。
+        toast("勾选的端口里没有住宅端口，未生成。请先在「本地端口」页开放住宅节点。", false);
+        return;
+      }
       if (checked.length) params.set("ports", checked.join(","));
     }
     try {
@@ -1150,8 +1234,7 @@ export function renderXui(root: HTMLElement): void {
             onclick: (e) => {
               const btn = e.target as HTMLButtonElement;
               const ta = btn.previousElementSibling as HTMLTextAreaElement;
-              void navigator.clipboard.writeText(ta.value);
-              toast("已复制");
+              void copyText(ta.value).then((ok) => toast(ok ? "已复制" : CLIPBOARD_HINT, ok));
             }
           }, "复制")
         );
@@ -1167,31 +1250,54 @@ export function renderXui(root: HTMLElement): void {
     }
   }
 
-  function checkedPorts(): number[] {
-    return Array.from(
-      document.querySelectorAll<HTMLInputElement>("#xui-ports input:checked")
-    ).map((c) => Number(c.dataset.port));
-  }
+  void loadFanoutPorts();
+}
 
-  void (async () => {
-    const box = document.getElementById("xui-ports");
-    if (!box) return;
-    try {
-      const { items } = await api.ports();
-      box.replaceChildren(
-        ...items.map((p) => {
-          const c = el("input", { type: "checkbox", "data-port": String(p.port) }) as HTMLInputElement;
-          c.checked = true;
-          return el(
-            "label",
-            { class: "chk" },
-            c,
-            ` ${p.port} (${p.protocol}${p.residential ? "·住宅" : ""}${p.country_code ? "·" + p.country_code : ""})`
-          );
-        })
-      );
-    } catch {
-      box.replaceChildren(el("span", { class: "dim" }, "无法加载端口列表"));
-    }
-  })();
+/**
+ * 3x-ui 页当前勾选的本地端口。residentialOnly 时只保留住宅端口，供 gen() 的
+ * 「仅住宅端口」按钮用（直连模式下后端不认 residential 参数，只能在前端筛）。
+ */
+function checkedPorts(residentialOnly = false): number[] {
+  return Array.from(
+    document.querySelectorAll<HTMLInputElement>("#xui-ports input:checked")
+  )
+    .filter((c) => !residentialOnly || c.dataset.res === "1")
+    .map((c) => Number(c.dataset.port));
+}
+
+// 导出给 main.ts 的 nav()：切到本页时重新拉一次端口列表。
+// 之前这个列表只在 renderXui() 里加载一次，而 renderXui 只在启动时跑一次，
+// 于是「节点池 -> 为勾选节点开放端口」之后新开的端口永远不会出现在这里，
+// 只能整页刷新；勾选集因此是过期的（空集还会让 gen()/doLink() 静默退回「全部端口」）。
+let portSeq = 0;
+
+export async function loadFanoutPorts(): Promise<void> {
+  const box = document.getElementById("xui-ports");
+  if (!box) return;
+  const seq = ++portSeq;
+  // 重新渲染时保留用户已经改过的勾选；首次加载才默认全选。
+  const first = box.childElementCount === 0;
+  const prev = first ? null : new Set(checkedPorts());
+  try {
+    const { items } = await api.ports();
+    if (seq !== portSeq) return;
+    box.replaceChildren(
+      ...items.map((p) => {
+        const c = el("input", {
+          type: "checkbox",
+          "data-port": String(p.port),
+          "data-res": p.residential ? "1" : "0"
+        }) as HTMLInputElement;
+        c.checked = prev ? prev.has(p.port) : true;
+        return el(
+          "label",
+          { class: "chk" },
+          c,
+          ` ${p.port} (${p.protocol}${p.residential ? "·住宅" : ""}${p.country_code ? "·" + p.country_code : ""})`
+        );
+      })
+    );
+  } catch {
+    box.replaceChildren(el("span", { class: "dim" }, "无法加载端口列表"));
+  }
 }
