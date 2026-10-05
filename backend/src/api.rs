@@ -835,14 +835,13 @@ async fn ports_assign(State(state): State<Arc<AppState>>, body: Option<Json<Valu
             assigned.push(json!({"key": k, "port": p2}));
         }
     }
-    // 关掉自动分配，避免下一轮把手动结果覆盖。
+    // 手动分配与自动分配互斥：把自动分配关掉，避免下一轮把刚开放的结果覆盖掉。
     //
     // 必须先释放写锁、再调用 save_config()：后者的第一句就是
     // `self.cfg.read().await`，而 tokio 的 RwLock 是公平且写优先的——已经持有
     // 写守卫的任务再排队申请读锁会**永久**死锁。这不是挂起一个请求，而是把整个
     // 服务卡死：/api/status、/api/proxies、调度循环、中继监管、检测器全都阻塞在
-    // state.config() 上。而且 auto_assign 默认就是 true，所以默认配置下点一次
-    // 「开放端口」就会触发。
+    // state.config() 上。
     let flipped = {
         let mut c = state.cfg.write().await;
         if c.fanout.auto_assign {
@@ -908,16 +907,18 @@ async fn ports_mode(State(state): State<Arc<AppState>>, body: Option<Json<Value>
     }
     if enabled {
         state.assign_ports().await;
-    } else {
-        // 切到手动：把此前自动铺上的端口全部收回，由用户自己勾选
-        let mut map = state.proxies.write().await;
-        for p in map.values_mut() {
-            p.local_port = None;
-        }
-        drop(map);
-        state.dirty.store(true, Ordering::Relaxed);
     }
-    Json(json!({ "ok": true, "auto": enabled })).into_response()
+    // Switching to manual deliberately does NOT revoke anything.
+    //
+    // It used to wipe `local_port` on every proxy, which is wrong now that
+    // `auto_assign` defaults to false: toggling the mode would destroy the ports
+    // the user opened by hand in the UI — the exact work they were trying to
+    // keep. It also conflicts with ports being sticky (see assign_ports).
+    //
+    // The mode only governs *future* automatic assignment. To give a port back,
+    // release it explicitly — there is a button for that on both pages.
+    let open = state.proxies.read().await.values().filter(|p| p.local_port.is_some()).count();
+    Json(json!({ "ok": true, "auto": enabled, "open_ports": open })).into_response()
 }
 
 async fn collect_port_entries(state: &Arc<AppState>) -> Vec<PortEntry> {

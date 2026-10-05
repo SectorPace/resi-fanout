@@ -96,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(w) = web_override {
         cfg.server.web_root = w;
     }
+    let fanout_cfg = cfg.fanout.clone();
     let state = Arc::new(state::AppState::new(cfg_path, PathBuf::from(data_dir), cfg));
     state.load_state().await;
 
@@ -105,6 +106,16 @@ async fn main() -> anyhow::Result<()> {
             openvpn::spawn_supervisor(state.clone());
             warp::supervisor(state.clone());
             scheduler::spawn(state.clone());
+            // 端口是按需开放的（fanout.auto_assign 默认 false），所以第一次跑起来
+            // 一个端口都不会有。说清楚这一点，否则「列表是空的」看起来像坏了。
+            if !fanout_cfg.auto_assign {
+                tracing::info!(
+                    "fanout ports open on demand only (fanout.auto_assign=false): \
+                     pick nodes on the 节点池 page and use 为勾选节点开放端口, \
+                     or set fanout.auto_assign=true to fill up to fanout.max_ports={} automatically",
+                    fanout_cfg.max_ports
+                );
+            }
             api::serve(state).await?;
         }
         "refresh" => {

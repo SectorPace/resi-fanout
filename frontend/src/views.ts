@@ -339,8 +339,48 @@ export function renderPorts(root: HTMLElement): void {
       }, "复制全部代理链接"),
       el("button", { onclick: () => void reload() }, "刷新列表")
     ),
+    el("div", { id: "port-mode" }),
     el("div", { id: "port-table" })
   );
+
+  // 端口分配模式。默认是「手动」：装完不抢端口，等用户在「节点池」勾选后点
+  // 「为勾选节点开放端口」。自动模式会按延迟铺满 max_ports —— 所以切过去之前
+  // 说清楚会发生什么，切回来之前也说明会收回哪些端口。
+  void (async () => {
+    const box = document.getElementById("port-mode");
+    if (!box) return;
+    const paint = async (): Promise<void> => {
+      let auto = false;
+      try {
+        auto = (await api.status()).auto_assign;
+      } catch (e) {
+        box.replaceChildren(el("span", { class: "dim" }, String(e)));
+        return;
+      }
+      box.replaceChildren(
+        el("span", { class: "dim" },
+          auto
+            ? "自动模式：服务按延迟自动铺端口。端口号一旦分配就保持不变，只有代理失效、被过滤或你手动释放时才会收回 —— 已分发出去的客户端链接不会因为延迟波动而失效。"
+            : "手动模式（默认）：不自动开端口。到「节点池」勾选节点后点「为勾选节点开放端口」。切换模式不会收回已开的端口。"
+        ),
+        el("button", {
+          onclick: async () => {
+            if (!auto && !window.confirm(
+              "切到自动模式后，服务会立刻按延迟把端口铺满上限（当前配置的最大端口数）。\n" +
+              "确定继续吗？"
+            )) return;
+            try {
+              await api.portsMode(!auto);
+              toast(!auto ? "已切到自动模式" : "已切到手动模式");
+              await paint();
+              await reload();
+            } catch (e) { toast(String(e), false); }
+          }
+        }, auto ? "改为手动（保留已开的端口）" : "改为自动（按延迟铺满）")
+      );
+    };
+    await paint();
+  })();
 
   async function reload(): Promise<void> {
     const box = document.getElementById("port-table");

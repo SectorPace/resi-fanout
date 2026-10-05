@@ -30,6 +30,7 @@ export interface Status {
   residential: number;
   ports: number;
   max_ports: number;
+  auto_assign: boolean;
   vpn_enabled: boolean;
   vpn_total: number;
   vpn_up: number;
@@ -264,6 +265,11 @@ export const api = {
     req("POST", "/api/ports/assign", { keys }),
   portsRelease: (p: { ports?: number[]; keys?: string[] }): Promise<{ ok: boolean; released: number }> =>
     req("POST", "/api/ports/release", p),
+  // Backend has had this endpoint all along; the UI never called it, so the
+  // auto/manual choice was unreachable and auto_assign could only ever be
+  // changed by hand-editing config.json.
+  portsMode: (auto: boolean): Promise<{ ok: boolean; auto: boolean; assigned?: number; released?: number }> =>
+    req("POST", "/api/ports/mode", { auto }),
   refresh: (): Promise<{ ok: boolean }> => req("POST", "/api/refresh"),
   check: (keys?: string[]): Promise<{ ok: boolean }> =>
     req("POST", "/api/check", keys && keys.length ? { keys } : {}),

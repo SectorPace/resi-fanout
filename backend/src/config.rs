@@ -72,8 +72,19 @@ pub struct FanoutCfg {
     /// Protocol spoken on the local ports: socks | http | mixed.
     pub mode: FanoutMode,
     pub max_ports: u32,
-    /// true = 按延迟自动把端口铺给最好的节点；
+    /// true = 服务按延迟自动把端口铺给最好的节点；
     /// false = 只给用户在 UI 里勾选的节点分配端口
+    ///
+    /// 默认 false，即**按需开端口**：装完不抢占任何端口，第一个端口都要用户
+    /// 在「节点池」页勾选节点并点「为勾选节点开放端口」才会出现。之前默认 true
+    /// 会在第一次抓取+检测结束后立刻铺满 `max_ports`，用户还没来得及决定要用
+    /// 哪些出口，端口就已经被占满、链接也已经生成好了。
+    ///
+    /// 参考 byJoey/fanout 的做法：它的出口完全由用户点「新建出口」时选定的
+    /// 地区和数量驱动，不会投机性地先把端口全开出来。
+    ///
+    /// 已有配置里这个键是显式写着的，所以升级不会改变老实例的行为；只有全新
+    /// 安装（以及删掉该键后回落到默认值）才会变成按需开端口。
     pub auto_assign: bool,
 }
 
@@ -86,7 +97,8 @@ impl Default for FanoutCfg {
             // keep the default modest; fanout ports are localhost-only, so
             // raise this in the UI only if you actually need more exits
             max_ports: 20,
-            auto_assign: true,
+            // 按需开端口：默认不自动铺端口，等用户在 UI 里勾选。
+            auto_assign: false,
         }
     }
 }

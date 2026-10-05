@@ -16,7 +16,7 @@
     "base_port": 20000,
     "mode": "socks",
     "max_ports": 20,
-    "auto_assign": true
+    "auto_assign": false
   },
   "checker": {
     "timeout_secs": 8,

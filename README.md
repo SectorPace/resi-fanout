@@ -23,7 +23,7 @@
 
 - **自动抓取**：内置 9 个免费代理源（monosans / TheSpeedX / hideip.me / proxifly / geonode），支持任意输出 `ip:port` 或 `proto://ip:port` 的自定义 URL —— **付费住宅代理服务商的提取链接也能直接填进去**。
 - **健康检查 + 住宅识别**：每个代理用它自己去请求 `ip-api.com`，拿到出口 IP、国家、ISP 和 `hosting` 标志；`hosting=false` 即判定为**住宅/家宽**线路，机房 IP 会被标记。
-- **扇出到本地端口**：每个存活代理绑定一个本地端口（默认 `127.0.0.1:20000+`），本地口支持 SOCKS5 / HTTP / mixed。延迟最低的代理拿最低的端口，死掉自动回收。
+- **扇出到本地端口**：每个存活代理绑定一个本地端口（默认 `127.0.0.1:20000+`），本地口支持 SOCKS5 / HTTP / mixed。**端口按需开放**：默认不自动占用任何端口，到「节点池」勾选节点后点「为勾选节点开放端口」；想要「装完就自动铺满」可在「本地端口」页一键切到自动模式。端口号一旦分配就保持不变 —— 只有代理失效、被过滤或你手动释放时才会收回，所以已分发出去的客户端链接不会因为延迟波动而失效。
 - **VPN Gate 隧道（可选）**：接入 [VPN Gate](https://www.vpngate.net) 公共中继列表（大量家宽志愿者节点），自动挑选最优服务器拉起 OpenVPN 旁挂隧道，**每条隧道一个本地 SOCKS 端口**，隧道出口同样做住宅识别，机房出口可自动换点。
 - **接入 3x-ui**：两种方式
   1. Web UI「接入 3x-ui」页一键生成 Xray `outbounds` / 路由规则，粘进面板的 Xray 配置即可；
@@ -231,7 +231,7 @@ sudo bash install.sh --with-masque   # 顺便下载 mihomo（原生 MASQUE 实�
 | `server.api_key` | 安装时随机 | 非空则所有 `/api` 需 `Authorization: Bearer` |
 | `fanout.bind` / `base_port` / `max_ports` | `127.0.0.1` / `20000` / `20` | 扇出端口范围 |
 | `fanout.mode` | `socks` | 本地口协议：`socks` / `http` / `mixed` |
-| `fanout.auto_assign` | `true` | `true` = 由服务自动为可用代理分配本地端口；`false` = 只使用你在 UI「端口」页手动指定的端口（代理不再被自动占用） |
+| `fanout.auto_assign` | `false` | `false`（默认）= **按需开端口**：装完不抢任何端口，到「节点池」勾选节点后点「为勾选节点开放端口」。`true` = 服务按延迟自动把端口铺满 `max_ports`。可在「本地端口」页一键切换 |
 | `filter.only_residential` | `false` | **只把住宅 IP 扇出成端口** |
 | `filter.countries` | `[]` | 国家白名单，如 `["US","JP"]` |
 | `checker.timeout_secs` / `concurrency` | `8` / `256` | 检测超时与并发上限。它只限制**同时在飞**的检测数，并不决定一轮多快：对真正打到接口的代理，ip-api 免费额度的**每分钟请求数**（约 45 次/分）才是瓶颈，超出只会收到 429，而 429 不会被当成「代理已死」，所以调高是安全的。调高仍然值得——**超时**的代理根本没打到接口、不消耗额度，4000 个死节点在 256 并发下约 2 分钟扫完，32 并发则要约 17 分钟。要真正加速分类，请把 `classify_url` 指向额度更高的接口。 |

@@ -193,9 +193,25 @@ impl AppState {
         true
     }
 
-    /// Give the best (alive + filtered) proxies one local port each.
-    /// Lowest latency gets the lowest port; existing assignments are kept
-    /// whenever still valid to avoid port churn.
+    /// Give (alive + filtered) proxies one local port each, up to `max_ports`.
+    ///
+    /// **Ports are sticky.** Once a proxy holds a port it keeps it for as long
+    /// as it stays alive and keeps passing the user's filters; the only things
+    /// that reclaim a port are the proxy dying, being filtered out, or the user
+    /// releasing it. This is load-bearing, not a nicety: the port number is
+    /// baked into every client link already handed out, so re-ranking by latency
+    /// and revoking the losers silently breaks live clients whenever the pool
+    /// wobbles. The previous implementation re-derived a top-N by latency every
+    /// cycle and set `local_port = None` on everyone who fell out of it, so a
+    /// single slow response could invalidate a link someone was actively using.
+    /// Same trade-off byJoey/fanout makes: swapping the node behind an exit is
+    /// fine, changing the port is not.
+    ///
+    /// Among the *free* slots the lowest-latency eligible proxies are chosen
+    /// first, so a fresh install still converges on the best exits.
+    ///
+    /// A no-op in manual mode (`auto_assign = false`, the default): ports then
+    /// come only from the user selecting nodes in the UI.
     pub async fn assign_ports(&self) {
         let cfg = self.config().await;
         // 手动模式：端口完全由用户在 UI 里勾选决定，自动分配不介入
@@ -209,32 +225,32 @@ impl AppState {
         let base = cfg.fanout.base_port as u32;
         let mut map = self.proxies.write().await;
 
-        let mut scored: Vec<(String, u64)> = map
-            .iter()
-            .filter(|(_, p)| Self::passes_filter(&cfg, p))
-            .map(|(k, p)| (k.clone(), p.latency_ms.unwrap_or(u64::MAX)))
-            .collect();
-        scored.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-        let chosen: Vec<String> = scored.into_iter().take(max).map(|(k, _)| k).collect();
-        let chosen_set: HashSet<String> = chosen.iter().cloned().collect();
-
-        for (k, p) in map.iter_mut() {
-            if !chosen_set.contains(k) {
-                p.local_port = None;
-            }
-        }
-
+        // Reclaim a port only from a proxy that stopped qualifying, and drop
+        // duplicates (reachable via a hand-edited or restored state.json).
         let mut used: HashSet<u16> = HashSet::new();
-        for k in &chosen {
-            if let Some(p) = map.get(k) {
-                if let Some(pt) = p.local_port {
-                    used.insert(pt);
+        let mut eligible: Vec<(String, u64)> = Vec::new();
+        for (k, p) in map.iter_mut() {
+            if !Self::passes_filter(&cfg, p) {
+                p.local_port = None; // dead or filtered out — give the slot back
+                continue;
+            }
+            match p.local_port {
+                Some(pt) => {
+                    if !used.insert(pt) {
+                        p.local_port = None; // two proxies claim one port
+                    }
                 }
+                None => eligible.push((k.clone(), p.latency_ms.unwrap_or(u64::MAX))),
             }
         }
 
-        for k in &chosen {
-            let Some(p) = map.get_mut(k) else { continue };
+        // Fill only the slots that are actually free.
+        eligible.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        for (k, _) in eligible {
+            if used.len() >= max {
+                break;
+            }
+            let Some(p) = map.get_mut(&k) else { continue };
             if p.local_port.is_some() {
                 continue;
             }
@@ -281,6 +297,153 @@ fn next_free_port(used: &HashSet<u16>, base: u32, max: usize) -> Option<u16> {
 mod tests {
     use super::*;
     use crate::models::TunnelStatus;
+
+    fn state_with(cfg: Config) -> AppState {
+        let dir = crate::config::writable_tmpdir("state-ports");
+        let _ = std::fs::remove_dir_all(&dir);
+        AppState::new(dir.join("config.json").to_string_lossy().into(), dir, cfg)
+    }
+
+    fn proxy(key: &str, alive: bool, latency: u64) -> ProxyInfo {
+        ProxyInfo {
+            key: key.to_string(),
+            protocol: crate::models::Protocol::Http,
+            ip: "1.2.3.4".into(),
+            port: 8080,
+            alive,
+            latency_ms: Some(latency),
+            ..Default::default()
+        }
+    }
+
+    fn auto_cfg(max_ports: u32) -> Config {
+        let mut c = Config::default();
+        c.fanout.auto_assign = true;
+        c.fanout.max_ports = max_ports;
+        c.fanout.base_port = 20000;
+        c
+    }
+
+    /// The whole point of the change: a proxy that keeps qualifying keeps its
+    /// port, even when a different proxy becomes faster. Revoking on rank is what
+    /// used to silently break client links.
+    #[tokio::test]
+    async fn ports_are_sticky_across_reranks() {
+        let st = state_with(auto_cfg(4));
+        {
+            let mut m = st.proxies.write().await;
+            m.insert("http://slow:1".into(), proxy("http://slow:1", true, 900));
+            m.insert("http://fast:2".into(), proxy("http://fast:2", true, 10));
+        }
+        st.assign_ports().await;
+        let before = {
+            let m = st.proxies.read().await;
+            (m["http://slow:1"].local_port, m["http://fast:2"].local_port)
+        };
+        assert!(before.0.is_some() && before.1.is_some(), "both should get a port");
+
+        // `slow` becomes very fast and `fast` becomes very slow.
+        {
+            let mut m = st.proxies.write().await;
+            m.get_mut("http://slow:1").unwrap().latency_ms = Some(5);
+            m.get_mut("http://fast:2").unwrap().latency_ms = Some(950);
+        }
+        st.assign_ports().await;
+        let after = {
+            let m = st.proxies.read().await;
+            (m["http://slow:1"].local_port, m["http://fast:2"].local_port)
+        };
+        assert_eq!(
+            before, after,
+            "ports must not move when only the latency ranking changes"
+        );
+    }
+
+    /// Sticky must not mean permanent: a proxy that stops qualifying gives the
+    /// slot back so it can be reused.
+    #[tokio::test]
+    async fn a_dead_proxy_releases_its_port_for_reuse() {
+        let st = state_with(auto_cfg(4));
+        {
+            let mut m = st.proxies.write().await;
+            m.insert("http://a:1".into(), proxy("http://a:1", true, 10));
+        }
+        st.assign_ports().await;
+        let first = st.proxies.read().await["http://a:1"].local_port;
+        assert!(first.is_some());
+
+        {
+            let mut m = st.proxies.write().await;
+            m.get_mut("http://a:1").unwrap().alive = false;
+            m.insert("http://b:2".into(), proxy("http://b:2", true, 20));
+        }
+        st.assign_ports().await;
+        let m = st.proxies.read().await;
+        assert_eq!(m["http://a:1"].local_port, None, "dead proxy keeps nothing");
+        assert_eq!(
+            m["http://b:2"].local_port, first,
+            "the freed slot should be reused, not a new one burned"
+        );
+    }
+
+    /// Manual mode is the default and must never touch assignments.
+    #[tokio::test]
+    async fn manual_mode_is_the_default_and_assigns_nothing() {
+        let mut c = Config::default();
+        c.fanout.base_port = 20000;
+        assert!(
+            !c.fanout.auto_assign,
+            "auto_assign must default to false (ports open on demand)"
+        );
+        let st = state_with(c);
+        {
+            let mut m = st.proxies.write().await;
+            m.insert("http://a:1".into(), proxy("http://a:1", true, 10));
+        }
+        st.assign_ports().await;
+        assert_eq!(st.proxies.read().await["http://a:1"].local_port, None);
+    }
+
+    /// A hand-edited or restored state.json can contain two proxies claiming one
+    /// port; the duplicate must be dropped rather than shadowing the first.
+    #[tokio::test]
+    async fn duplicate_ports_are_collapsed() {
+        let st = state_with(auto_cfg(4));
+        {
+            let mut m = st.proxies.write().await;
+            let mut a = proxy("http://a:1", true, 10);
+            a.local_port = Some(20000);
+            let mut b = proxy("http://b:2", true, 20);
+            b.local_port = Some(20000);
+            m.insert("http://a:1".into(), a);
+            m.insert("http://b:2".into(), b);
+        }
+        st.assign_ports().await;
+        let m = st.proxies.read().await;
+        let held: Vec<u16> = m.values().filter_map(|p| p.local_port).collect();
+        let mut uniq = held.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(held.len(), uniq.len(), "two proxies share a port: {held:?}");
+    }
+
+    /// Never exceed the configured ceiling.
+    #[tokio::test]
+    async fn never_exceeds_max_ports() {
+        let st = state_with(auto_cfg(3));
+        {
+            let mut m = st.proxies.write().await;
+            for i in 0..10 {
+                let k = format!("http://p{i}:1");
+                m.insert(k.clone(), proxy(&k, true, 100 + i));
+            }
+        }
+        st.assign_ports().await;
+        let m = st.proxies.read().await;
+        let n = m.values().filter(|p| p.local_port.is_some()).count();
+        assert_eq!(n, 3, "should fill exactly the ceiling");
+        assert!(m.values().all(|p| p.local_port.is_none_or(|x| (20000..20003).contains(&x))));
+    }
 
     const OLD_STATE: &str = r#"{
       "proxies": [{"key":"http://1.2.3.4:8080","protocol":"http","ip":"1.2.3.4","port":8080,"alive":true,"local_port":13000}],
