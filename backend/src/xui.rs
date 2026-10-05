@@ -370,26 +370,44 @@ mod tests {
         let existing = std::env::current_exe().unwrap();
         assert_eq!(probe(existing.to_str().unwrap()), DbProbe::Found);
 
-        // End-to-end: a directory we cannot traverse -> NotPermitted.
-        // Needs both a non-root uid (root bypasses permission bits) and a
-        // filesystem that honours the mode. CI is ext4 + unprivileged, so the
-        // branch is live there; verify the chmod actually took effect before
-        // asserting, so this degrades to a skip rather than a false failure.
+        // End-to-end: a path reached *through* an unreadable directory -> NotPermitted.
+        // Two preconditions, both checked rather than assumed, because CI is the
+        // only place this actually runs:
+        //   - a non-root uid (root bypasses permission bits), and
+        //   - a filesystem that honours the mode (WSL's /mnt/e is DrvFs:
+        //     ownership pinned to root, `chmod` silently dropped).
+        // The probe target must be INSIDE the locked-down directory, not the
+        // directory itself: stat() on an inode needs only search permission on
+        // its *parent*, so `metadata(<the 000 dir>)` succeeds and would report
+        // Found. Verified on a loop-mounted ext4 image:
+        //   stat(<000 dir>)          -> 0                (Found)
+        //   stat(<000 dir>/inner)    -> Permission denied (NotPermitted)
         #[cfg(unix)]
         if unsafe { libc::geteuid() } != 0 {
             use std::os::unix::fs::PermissionsExt;
             let dir = crate::config::writable_tmpdir("xui-perm");
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(dir.join("inner")).unwrap();
+            let inner = dir.join("inner/target.db");
+            std::fs::write(&inner, b"x").unwrap();
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
-            let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
-            if mode == 0 {
+
+            let mode = std::fs::metadata(&dir)
+                .ok()
+                .map(|m| m.permissions().mode() & 0o7777);
+            let chmod_took = mode == Some(0);
+            let denied = std::fs::metadata(&inner)
+                .err()
+                .map(|e| e.kind())
+                .filter(|k| *k == std::io::ErrorKind::PermissionDenied);
+
+            if chmod_took && denied.is_some() {
+                let cfg2 = cfg_with(inner.to_str().unwrap());
                 assert_eq!(
-                    probe(dir.to_str().unwrap()),
+                    probe(inner.to_str().unwrap()),
                     DbProbe::NotPermitted,
-                    "unreadable dir must not look Missing"
+                    "unreachable path must not look Missing"
                 );
-                let cfg2 = cfg_with(dir.to_str().unwrap());
                 let msg = not_found_message(&anyhow::anyhow!("boom"), &cfg2);
                 assert!(msg.contains("存在却无法读取"), "{msg}");
                 assert!(msg.contains("setfacl"), "hint must name a fix: {msg}");
